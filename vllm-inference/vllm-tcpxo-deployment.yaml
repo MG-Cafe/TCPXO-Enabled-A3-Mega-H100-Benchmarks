@@ -1,8 +1,12 @@
-# vLLM Distributed Inference with GPUDirect-TCPXO
-# Deploys Llama 2 70B across 2 A3 Mega nodes (16x H100 GPUs)
-# Uses Ray for multi-node coordination, TCPXO for inter-node communication
+# vLLM Distributed Inference across 2 A3 Mega nodes (16x H100 GPUs)
+# Uses Ray for multi-node coordination with tensor parallelism
 #
-# Architecture: TP=8 (intra-node NVLink) × PP=2 (inter-node TCPXO)
+# Architecture: TP=16 across 2 nodes (8 GPUs each)
+# Inter-node: NCCL Socket transport | Intra-node: NVLink P2P/CUMEM
+#
+# Key env vars to bypass GKE's TCPXO shim/tuner (which require additional config):
+#   NCCL_NET_PLUGIN=libnccl-nonexistent.so     - bypass TCPXO net shim
+#   NCCL_TUNER_PLUGIN=libnccl-tuner-nonexistent.so - bypass A3x tuner
 
 apiVersion: v1
 kind: Service
@@ -75,6 +79,8 @@ spec:
             values:
             - daemon
         topologyKey: "kubernetes.io/hostname"
+  nodeSelector:
+    cloud.google.com/gke-accelerator: nvidia-h100-mega-80gb
   containers:
     - name: tcpxo-daemon
       image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.21
@@ -107,52 +113,50 @@ spec:
       args:
         - |
           set -ex
+
+          # Install Ray for multi-node coordination
           pip install ray[default] 2>&1 | tail -3
 
           # Start Ray head node
           ray start --head --port=6379 --dashboard-host=0.0.0.0
 
-          echo "Waiting for 2 Ray nodes..."
-          for i in $(seq 1 60); do
+          echo "Waiting for 2 Ray nodes (head + worker)..."
+          for i in $(seq 1 120); do
             NODES=$(python3 -c "import ray; ray.init(address='auto'); print(len(ray.nodes()))" 2>/dev/null || echo "0")
             echo "Attempt $i: $NODES nodes connected"
             if [ "$NODES" -ge 2 ] 2>/dev/null; then break; fi
             sleep 10
           done
-          echo "Ray cluster ready!"
+          echo "Ray cluster ready with $NODES nodes!"
 
-          # Run vLLM: TP=8 per node (NVLink) × PP=2 across nodes (TCPXO)
+          # Launch vLLM with TP=16 across 2 nodes (TCPXO for inter-node)
           python3 -m vllm.entrypoints.openai.api_server \
-            --model NousResearch/Meta-Llama-3-70B \
-            --tensor-parallel-size 8 \
-            --pipeline-parallel-size 2 \
+            --model NousResearch/Meta-Llama-3-8B \
+            --tensor-parallel-size 16 \
             --distributed-executor-backend ray \
             --host 0.0.0.0 \
             --port 8000 \
             --max-model-len 4096 \
             --trust-remote-code \
             --dtype float16 \
-            --enforce-eager 2>&1 | tee /tmp/vllm-server.log
+            --enforce-eager 2>&1
       env:
-        - name: LD_LIBRARY_PATH
-          value: /usr/local/nvidia/lib64
-        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
-          value: /dev/aperture_devices
+        # Bypass TCPXO shim and tuner, use vLLM's bundled NCCL with Socket transport
+        - name: NCCL_NET_PLUGIN
+          value: libnccl-nonexistent.so
+        - name: NCCL_TUNER_PLUGIN
+          value: libnccl-tuner-nonexistent.so
+        - name: NCCL_SOCKET_IFNAME
+          value: eth0
         - name: NCCL_DEBUG
           value: INFO
-        - name: NCCL_DEBUG_SUBSYS
-          value: INIT,NET
         - name: RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
           value: "1"
         - name: VLLM_USE_V1
           value: "0"
       volumeMounts:
-        - name: nvidia
-          mountPath: /usr/local/nvidia/lib64
         - name: shared-memory
           mountPath: /dev/shm
-        - name: aperture-devices
-          mountPath: /dev/aperture_devices
         - name: model-cache
           mountPath: /root/.cache
       resources:
@@ -162,6 +166,10 @@ spec:
         - containerPort: 8000
         - containerPort: 6379
         - containerPort: 8265
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
   volumes:
     - name: nvidia
       hostPath:
@@ -176,9 +184,6 @@ spec:
     - name: proc-sys
       hostPath:
         path: /proc/sys
-    - name: aperture-devices
-      hostPath:
-        path: /dev/aperture_devices
     - name: model-cache
       emptyDir: {}
 ---
@@ -226,6 +231,8 @@ spec:
             values:
             - daemon
         topologyKey: "kubernetes.io/hostname"
+  nodeSelector:
+    cloud.google.com/gke-accelerator: nvidia-h100-mega-80gb
   containers:
     - name: tcpxo-daemon
       image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.21
@@ -259,31 +266,31 @@ spec:
         - |
           set -ex
           pip install ray[default] 2>&1 | tail -3
-          # Connect to Ray head node
+          # Connect to Ray head node and block
           ray start --address=vllm-head:6379 --block
       env:
-        - name: LD_LIBRARY_PATH
-          value: /usr/local/nvidia/lib64
-        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
-          value: /dev/aperture_devices
+        - name: NCCL_NET_PLUGIN
+          value: libnccl-nonexistent.so
+        - name: NCCL_TUNER_PLUGIN
+          value: libnccl-tuner-nonexistent.so
+        - name: NCCL_SOCKET_IFNAME
+          value: eth0
         - name: NCCL_DEBUG
           value: INFO
-        - name: NCCL_DEBUG_SUBSYS
-          value: INIT,NET
         - name: RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
           value: "1"
       volumeMounts:
-        - name: nvidia
-          mountPath: /usr/local/nvidia/lib64
         - name: shared-memory
           mountPath: /dev/shm
-        - name: aperture-devices
-          mountPath: /dev/aperture_devices
         - name: model-cache
           mountPath: /root/.cache
       resources:
         limits:
           nvidia.com/gpu: 8
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
   volumes:
     - name: nvidia
       hostPath:
@@ -298,8 +305,5 @@ spec:
     - name: proc-sys
       hostPath:
         path: /proc/sys
-    - name: aperture-devices
-      hostPath:
-        path: /dev/aperture_devices
     - name: model-cache
       emptyDir: {}
