@@ -1,5 +1,5 @@
-# vLLM Single-Node Inference on A3 Mega (8x H100, TP=8)
-# Uses NCCL_NET_PLUGIN=none to bypass TCPXO shim for intra-node NVLink
+# vLLM Single-Node Inference on A3 Mega (H100)
+# Uses NCCL_NET_PLUGIN to bypass TCPXO shim (version mismatch with bundled NCCL)
 apiVersion: v1
 kind: Service
 metadata:

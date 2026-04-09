@@ -4,7 +4,7 @@
 
 This guide documents the end-to-end setup and benchmarking of GPUDirect-TCPXO (FasTrak) on Google Kubernetes Engine (GKE) using A3 Mega VMs with NVIDIA H100 Mega 80GB GPUs. It covers infrastructure setup, NCCL benchmarking (intra-node and multi-node with and without TCPXO), and detailed configuration steps.
 
-**Reference:** [GCP Documentation - Maximize GPU network bandwidth in Standard mode clusters](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/gpu-bandwidth-gpudirect-tcpx)
+**Reference:** [GCP Documentation - Maximize GPU network bandwidth in Standard mode clusters](https://cloud.google.com/kubernetes-engine/docs/how-to/gpu-bandwidth-gpudirect-tcpx)
 
 ### Architecture
 - **Cluster**: GKE regional cluster in `us-west1` with multi-networking and Dataplane V2
@@ -23,7 +23,7 @@ This guide documents the end-to-end setup and benchmarking of GPUDirect-TCPXO (F
 | Multi-node TCP baseline | 16 GPUs (2×8), all_reduce | **3.74 GB/s** | — |
 | **Multi-node TCPXO** | **16 GPUs (2×8), all_gather** | **188.82 GB/s** | **53.27 GB/s** |
 
-**TCPXO Speedup over TCP: ~52x** (188.82 vs 3.50 GB/s at large message sizes)
+**TCPXO Speedup over TCP: ~50x** (188.82 / 3.74 GB/s peak bus bandwidth)
 
 ---
 
@@ -265,7 +265,7 @@ kubectl exec nccl-test-host-1 -c nccl-test -- bash -c \
 
 **Key findings:**
 - **Note:** TCPXO test uses `all_gather` (the official benchmark) while TCP baseline used `all_reduce`. Bus bandwidth normalizes for collective type, making comparison valid.
-- **GPUDirect-TCPXO delivers ~188 GB/s** inter-node bus bandwidth at large sizes — a **52x improvement** over standard TCP
+- **GPUDirect-TCPXO delivers ~188 GB/s** inter-node bus bandwidth at large sizes — a **~50x improvement** over standard TCP
 - At 8GB, the **algorithm bandwidth reaches 201 GB/s** (total across 8 GPUDirect NICs)
 - TCPXO achieves **~40% of intra-node NVLink bandwidth** for inter-node communication
 - Speedup is most dramatic at large message sizes; small messages are latency-bound
@@ -318,6 +318,72 @@ kubectl exec nccl-test-host-1 -c nccl-test -- bash -c \
    - Env: `NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY=/dev/aperture_devices`
    - Env: `LD_LIBRARY_PATH=/usr/local/nvidia/lib64`
    - Volume: `/dev/aperture_devices` from hostPath
+
+---
+
+## vLLM Inference Benchmark
+
+### Overview
+
+To demonstrate real-world GPU workloads on the TCPXO-enabled A3 Mega cluster, we deployed [vLLM](https://github.com/vllm-project/vllm) v0.19.0 to serve the **Meta-Llama-3-8B** model (FP16) on a single H100 GPU.
+
+**Key finding:** The TCPXO NCCL shim (`libnccl-net.so`) installed by the TCPXO installer conflicts with vLLM's bundled NCCL 2.27.5 (host has 2.28.7). Setting `NCCL_NET_PLUGIN=libnccl-nonexistent.so` bypasses the shim for intra-node workloads. See `vllm-inference/vllm-single-node.yaml` for the working configuration.
+
+### Deployment
+
+```bash
+kubectl apply -f vllm-inference/vllm-single-node.yaml
+# Wait ~60 seconds for model download and loading
+kubectl logs vllm-inference --tail=3
+# Should show: "Application startup complete."
+```
+
+### Inference Results
+
+**Model:** NousResearch/Meta-Llama-3-8B (FP16, 14.96 GiB)
+**Engine:** vLLM v0.19.0, V1 engine, FlashAttention v3
+**GPU:** 1x NVIDIA H100 Mega 80GB
+**Model Load Time:** 29.7 seconds
+
+#### Single Request Latency (varying output length)
+
+| Max Tokens | Latency (ms) | Decode Speed (tokens/sec) |
+|-----------:|-------------:|--------------------------:|
+| 32 | 800 | 40.0 |
+| 64 | 919 | 69.6 |
+| 128 | 1,303 | 98.2 |
+| 256 | 2,211 | 115.8 |
+| 512 | 3,871 | 132.3 |
+
+**Peak decode speed:** 132.3 tokens/sec at 512 output tokens
+
+#### Concurrent Request Throughput
+
+| Concurrency | Total Requests | Total Time (ms) | Requests/sec | Avg Latency (ms) |
+|------------:|---------------:|----------------:|-------------:|------------------:|
+| 1 | 4 | 3,656 | 1.09 | 914 |
+| 4 | 16 | 3,961 | 4.04 | 248 |
+| 8 | 32 | 5,963 | 5.37 | 186 |
+| 16 | 64 | 6,134 | 10.43 | 96 |
+
+**Peak throughput:** 10.43 req/sec at concurrency 16
+
+#### Time to First Token (TTFT)
+
+| Prompt Length | TTFT (ms) |
+|--------------|----------:|
+| Short (1 token) | 442 |
+| Long (~50 tokens) | 407 |
+
+> **Note:** TTFT measurements include `kubectl exec` overhead (~300-400ms). Actual GPU-side TTFT is significantly lower.
+
+### NCCL Shim Compatibility Note
+
+On TCPXO-enabled A3 Mega nodes, the NCCL TCPXO installer places a network shim (`libnccl-net.so`) in the driver path that is auto-mounted into all GPU containers. This shim is compiled for NCCL 2.28.7, but vLLM v0.19.0 bundles NCCL 2.27.5 via PyTorch. The version mismatch causes `ncclCommInitRank` to fail with "NCCL internal error" when using tensor parallelism (TP > 1).
+
+**Workaround:** Set `NCCL_NET_PLUGIN=libnccl-nonexistent.so` as an environment variable. This causes NCCL to skip loading the external net plugin, falling back to built-in transports (NVLink for intra-node). This is appropriate for single-node inference where inter-node communication is not needed.
+
+For multi-node vLLM inference requiring TCPXO, use a vLLM container with matching NCCL version (2.28.7) or build from source against the host NCCL libraries.
 
 ---
 

@@ -9,9 +9,9 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 |-----------|-------------------:|--------:|
 | Intra-node NVLink (8 GPUs) | **471.40 GB/s** | baseline |
 | Inter-node TCP (16 GPUs) | **3.74 GB/s** | 1x |
-| **Inter-node TCPXO (16 GPUs)** | **188.82 GB/s** | **~52x** |
+| **Inter-node TCPXO (16 GPUs)** | **188.82 GB/s** | **~50x** |
 
-> GPUDirect-TCPXO delivers **188 GB/s** inter-node bandwidth — a **52x speedup** over standard TCP networking.
+> GPUDirect-TCPXO delivers **188 GB/s** inter-node bandwidth — a **~50x speedup** over standard TCP networking.
 
 ### vLLM Inference on H100
 | Metric | Value |
@@ -226,7 +226,7 @@ done
 
 ## 🔗 References
 
-- [GCP: Maximize GPU network bandwidth in Standard mode clusters](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/gpu-bandwidth-gpudirect-tcpx)
+- [GCP: Maximize GPU network bandwidth in Standard mode clusters](https://cloud.google.com/kubernetes-engine/docs/how-to/gpu-bandwidth-gpudirect-tcpx)
 - [GoogleCloudPlatform/container-engine-accelerators (GitHub)](https://github.com/GoogleCloudPlatform/container-engine-accelerators/tree/master/gpudirect-tcpxo)
 - [NVIDIA NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/)
 
@@ -241,3 +241,5 @@ done
 | RxDM (tcpgpudmarxd) | v1.0.21 |
 | GPU | NVIDIA H100 Mega 80GB HBM3 |
 | Machine Type | a3-megagpu-8g |
+| vLLM | 0.19.0 (V1 engine) |
+| vLLM NCCL | 2.27.5 (bundled via PyTorch) |
