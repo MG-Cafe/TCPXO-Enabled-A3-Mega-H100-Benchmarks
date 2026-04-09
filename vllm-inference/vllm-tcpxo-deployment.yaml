@@ -1,0 +1,305 @@
+# vLLM Distributed Inference with GPUDirect-TCPXO
+# Deploys Llama 2 70B across 2 A3 Mega nodes (16x H100 GPUs)
+# Uses Ray for multi-node coordination, TCPXO for inter-node communication
+#
+# Architecture: TP=8 (intra-node NVLink) × PP=2 (inter-node TCPXO)
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-head
+spec:
+  selector:
+    name: vllm-head
+  clusterIP: None
+  ports:
+    - name: ray-client
+      port: 10001
+    - name: ray-dashboard
+      port: 8265
+    - name: ray-gcs
+      port: 6379
+    - name: vllm-api
+      port: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-worker
+spec:
+  selector:
+    name: vllm-worker
+  clusterIP: None
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-head
+  labels:
+    name: vllm-head
+    tcpxo: daemon
+  annotations:
+    devices.gke.io/container.tcpxo-daemon: |+
+      - path: /dev/nvidia0
+      - path: /dev/nvidia1
+      - path: /dev/nvidia2
+      - path: /dev/nvidia3
+      - path: /dev/nvidia4
+      - path: /dev/nvidia5
+      - path: /dev/nvidia6
+      - path: /dev/nvidia7
+      - path: /dev/nvidiactl
+      - path: /dev/nvidia-uvm
+      - path: /dev/dmabuf_import_helper
+    networking.gke.io/default-interface: 'eth0'
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"eth1","network":"vpc1"},
+        {"interfaceName":"eth2","network":"vpc2"},
+        {"interfaceName":"eth3","network":"vpc3"},
+        {"interfaceName":"eth4","network":"vpc4"},
+        {"interfaceName":"eth5","network":"vpc5"},
+        {"interfaceName":"eth6","network":"vpc6"},
+        {"interfaceName":"eth7","network":"vpc7"},
+        {"interfaceName":"eth8","network":"vpc8"}
+      ]
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: tcpxo
+            operator: In
+            values:
+            - daemon
+        topologyKey: "kubernetes.io/hostname"
+  containers:
+    - name: tcpxo-daemon
+      image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.21
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -ex
+          chmod 755 /fts/entrypoint_rxdm_container.sh
+          /fts/entrypoint_rxdm_container.sh --num_hops=2 --num_nics=8
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+            - NET_BIND_SERVICE
+      volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
+        - name: sys
+          mountPath: /hostsysfs
+        - name: proc-sys
+          mountPath: /hostprocsysfs
+      env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+    - name: vllm
+      image: vllm/vllm-openai:latest
+      imagePullPolicy: Always
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -ex
+          pip install ray[default] 2>&1 | tail -3
+
+          # Start Ray head node
+          ray start --head --port=6379 --dashboard-host=0.0.0.0
+
+          echo "Waiting for 2 Ray nodes..."
+          for i in $(seq 1 60); do
+            NODES=$(python3 -c "import ray; ray.init(address='auto'); print(len(ray.nodes()))" 2>/dev/null || echo "0")
+            echo "Attempt $i: $NODES nodes connected"
+            if [ "$NODES" -ge 2 ] 2>/dev/null; then break; fi
+            sleep 10
+          done
+          echo "Ray cluster ready!"
+
+          # Run vLLM: TP=8 per node (NVLink) × PP=2 across nodes (TCPXO)
+          python3 -m vllm.entrypoints.openai.api_server \
+            --model NousResearch/Meta-Llama-3-70B \
+            --tensor-parallel-size 8 \
+            --pipeline-parallel-size 2 \
+            --distributed-executor-backend ray \
+            --host 0.0.0.0 \
+            --port 8000 \
+            --max-model-len 4096 \
+            --trust-remote-code \
+            --dtype float16 \
+            --enforce-eager 2>&1 | tee /tmp/vllm-server.log
+      env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
+          value: /dev/aperture_devices
+        - name: NCCL_DEBUG
+          value: INFO
+        - name: NCCL_DEBUG_SUBSYS
+          value: INIT,NET
+        - name: RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
+          value: "1"
+        - name: VLLM_USE_V1
+          value: "0"
+      volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
+        - name: shared-memory
+          mountPath: /dev/shm
+        - name: aperture-devices
+          mountPath: /dev/aperture_devices
+        - name: model-cache
+          mountPath: /root/.cache
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+      ports:
+        - containerPort: 8000
+        - containerPort: 6379
+        - containerPort: 8265
+  volumes:
+    - name: nvidia
+      hostPath:
+        path: /home/kubernetes/bin/nvidia/lib64
+    - name: shared-memory
+      emptyDir:
+        medium: "Memory"
+        sizeLimit: 200Gi
+    - name: sys
+      hostPath:
+        path: /sys
+    - name: proc-sys
+      hostPath:
+        path: /proc/sys
+    - name: aperture-devices
+      hostPath:
+        path: /dev/aperture_devices
+    - name: model-cache
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-worker
+  labels:
+    name: vllm-worker
+    tcpxo: daemon
+  annotations:
+    devices.gke.io/container.tcpxo-daemon: |+
+      - path: /dev/nvidia0
+      - path: /dev/nvidia1
+      - path: /dev/nvidia2
+      - path: /dev/nvidia3
+      - path: /dev/nvidia4
+      - path: /dev/nvidia5
+      - path: /dev/nvidia6
+      - path: /dev/nvidia7
+      - path: /dev/nvidiactl
+      - path: /dev/nvidia-uvm
+      - path: /dev/dmabuf_import_helper
+    networking.gke.io/default-interface: 'eth0'
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"eth1","network":"vpc1"},
+        {"interfaceName":"eth2","network":"vpc2"},
+        {"interfaceName":"eth3","network":"vpc3"},
+        {"interfaceName":"eth4","network":"vpc4"},
+        {"interfaceName":"eth5","network":"vpc5"},
+        {"interfaceName":"eth6","network":"vpc6"},
+        {"interfaceName":"eth7","network":"vpc7"},
+        {"interfaceName":"eth8","network":"vpc8"}
+      ]
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: tcpxo
+            operator: In
+            values:
+            - daemon
+        topologyKey: "kubernetes.io/hostname"
+  containers:
+    - name: tcpxo-daemon
+      image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.21
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -ex
+          chmod 755 /fts/entrypoint_rxdm_container.sh
+          /fts/entrypoint_rxdm_container.sh --num_hops=2 --num_nics=8
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+            - NET_BIND_SERVICE
+      volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
+        - name: sys
+          mountPath: /hostsysfs
+        - name: proc-sys
+          mountPath: /hostprocsysfs
+      env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+    - name: vllm-worker
+      image: vllm/vllm-openai:latest
+      imagePullPolicy: Always
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -ex
+          pip install ray[default] 2>&1 | tail -3
+          # Connect to Ray head node
+          ray start --address=vllm-head:6379 --block
+      env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
+          value: /dev/aperture_devices
+        - name: NCCL_DEBUG
+          value: INFO
+        - name: NCCL_DEBUG_SUBSYS
+          value: INIT,NET
+        - name: RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
+          value: "1"
+      volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
+        - name: shared-memory
+          mountPath: /dev/shm
+        - name: aperture-devices
+          mountPath: /dev/aperture_devices
+        - name: model-cache
+          mountPath: /root/.cache
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+  volumes:
+    - name: nvidia
+      hostPath:
+        path: /home/kubernetes/bin/nvidia/lib64
+    - name: shared-memory
+      emptyDir:
+        medium: "Memory"
+        sizeLimit: 200Gi
+    - name: sys
+      hostPath:
+        path: /sys
+    - name: proc-sys
+      hostPath:
+        path: /proc/sys
+    - name: aperture-devices
+      hostPath:
+        path: /dev/aperture_devices
+    - name: model-cache
+      emptyDir: {}

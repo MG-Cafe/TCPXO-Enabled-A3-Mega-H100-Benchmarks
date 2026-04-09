@@ -4,6 +4,7 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 
 ## 🚀 Results at a Glance
 
+### NCCL Communication Benchmarks
 | Benchmark | Peak Bus Bandwidth | Speedup |
 |-----------|-------------------:|--------:|
 | Intra-node NVLink (8 GPUs) | **471.40 GB/s** | baseline |
@@ -11,6 +12,15 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 | **Inter-node TCPXO (16 GPUs)** | **188.82 GB/s** | **~52x** |
 
 > GPUDirect-TCPXO delivers **188 GB/s** inter-node bandwidth — a **52x speedup** over standard TCP networking.
+
+### vLLM Inference on H100
+| Metric | Value |
+|--------|------:|
+| Model | Meta-Llama-3-8B (FP16) |
+| Peak Decode Speed | **132.3 tokens/sec** |
+| Peak Throughput (16 concurrent) | **10.43 req/sec** |
+| Time to First Token | **~420ms** |
+| Model Load Time | **29.7 seconds** |
 
 ## 📋 Prerequisites
 
@@ -208,7 +218,11 @@ done
 | File | Description |
 |------|-------------|
 | `README.md` | This step-by-step setup guide |
-| `docs/benchmark-report.md` | Detailed benchmark report with all results and architecture deep-dive |
+| `docs/benchmark-report.md` | Detailed NCCL benchmark report with all results and architecture deep-dive |
+| `vllm-inference/vllm-single-node.yaml` | Kubernetes Pod spec for vLLM on A3 Mega H100 |
+| `vllm-inference/vllm-tcpxo-deployment.yaml` | Multi-node vLLM deployment with TCPXO (experimental) |
+| `vllm-inference/run-benchmark.sh` | Inference benchmark script (latency, throughput, TTFT) |
+| `vllm-inference/benchmark-results.txt` | Raw benchmark output |
 
 ## 🔗 References
 
