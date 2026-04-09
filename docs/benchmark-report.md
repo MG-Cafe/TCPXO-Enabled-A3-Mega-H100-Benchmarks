@@ -20,10 +20,10 @@ This guide documents the end-to-end setup and benchmarking of GPUDirect-TCPXO (F
 | Benchmark | Config | Peak Bus BW | Avg Bus BW |
 |-----------|--------|------------:|----------:|
 | Intra-node (NVLink) | 8 GPUs, all_reduce | **471.40 GB/s** | — |
-| Multi-node TCP baseline | 16 GPUs (2×8), all_reduce | **3.74 GB/s** | — |
+| Multi-node TCP baseline | 16 GPUs (2×8), all_reduce | **3.60 GB/s** | — |
 | **Multi-node TCPXO** | **16 GPUs (2×8), all_gather** | **188.82 GB/s** | **53.27 GB/s** |
 
-**TCPXO Speedup over TCP: ~50x** (188.82 / 3.74 GB/s peak bus bandwidth)
+**TCPXO Speedup over TCP: ~52x** (188.82 / 3.60 GB/s peak bus bandwidth)
 
 ---
 
@@ -229,7 +229,7 @@ kubectl exec nccl-test-host-1 -c nccl-test -- bash -c \
 | 512MB | 1150.186 | 1.87 | 3.50 |
 | **1GB** | **2301.214** | **1.87** | **3.50** |
 
-**Peak Bus Bandwidth (TCP baseline):** 3.74 GB/s — bottlenecked by single eth0 NIC
+**Peak Bus Bandwidth (TCP baseline):** 3.60 GB/s — bottlenecked by single eth0 NIC
 
 ### Test 3: Multi-Node NCCL All-Gather (WITH GPUDirect-TCPXO) ⚡
 
@@ -258,14 +258,14 @@ kubectl exec nccl-test-host-1 -c nccl-test -- bash -c \
 
 | Metric | Intra-node (NVLink) | Inter-node TCP | **Inter-node TCPXO** | Speedup |
 |--------|--------------------:|---------------:|---------------------:|--------:|
-| Peak Bus BW | 471.40 GB/s | 3.74 GB/s | **188.82 GB/s** | **~50x** |
+| Peak Bus BW | 471.40 GB/s | 3.60 GB/s | **188.82 GB/s** | **~52x** |
 | 1GB Bus BW | 466.26 GB/s | 3.50 GB/s | **183.13 GB/s** | **~52x** |
 | 128MB Bus BW | 396.60 GB/s | 3.55 GB/s | **157.89 GB/s** | **~44x** |
 | 16MB Bus BW | 232.08 GB/s | 3.60 GB/s | **72.83 GB/s** | **~20x** |
 
 **Key findings:**
 - **Note:** TCPXO test uses `all_gather` (the official benchmark) while TCP baseline used `all_reduce`. Bus bandwidth normalizes for collective type, making comparison valid.
-- **GPUDirect-TCPXO delivers ~188 GB/s** inter-node bus bandwidth at large sizes — a **~50x improvement** over standard TCP
+- **GPUDirect-TCPXO delivers ~188 GB/s** inter-node bus bandwidth at large sizes — a **~52x improvement** over standard TCP
 - At 8GB, the **algorithm bandwidth reaches 201 GB/s** (total across 8 GPUDirect NICs)
 - TCPXO achieves **~40% of intra-node NVLink bandwidth** for inter-node communication
 - Speedup is most dramatic at large message sizes; small messages are latency-bound
@@ -383,7 +383,29 @@ On TCPXO-enabled A3 Mega nodes, the NCCL TCPXO installer places a network shim (
 
 **Workaround:** Set `NCCL_NET_PLUGIN=libnccl-nonexistent.so` as an environment variable. This causes NCCL to skip loading the external net plugin, falling back to built-in transports (NVLink for intra-node). This is appropriate for single-node inference where inter-node communication is not needed.
 
-For multi-node vLLM inference requiring TCPXO, use a vLLM container with matching NCCL version (2.28.7) or build from source against the host NCCL libraries.
+### Multi-Node vLLM Inference (TP=16, 2 Nodes)
+
+We also deployed vLLM across **2 A3 Mega nodes** with **tensor parallelism = 16** using Ray as the distributed executor backend.
+
+**Configuration:** vLLM v0.19.0, Ray distributed executor, TP=16 across 2 A3 Mega nodes (16× H100), NCCL Socket transport, enforce-eager mode, float16.
+
+**Key env vars for multi-node:**
+- `NCCL_NET_PLUGIN=libnccl-nonexistent.so` — bypass TCPXO net shim
+- `NCCL_TUNER_PLUGIN=libnccl-tuner-nonexistent.so` — bypass A3x tuner plugin
+
+| Metric | Value |
+|--------|------:|
+| Single request latency (50 tokens) | 1,159ms (~43 tok/s) |
+| Single request latency (100 tokens) | 2,242ms (~45 tok/s) |
+| Single request latency (200 tokens) | 4,508ms (~44 tok/s) |
+| Concurrent throughput (10 reqs × 100 tokens) | 5,088ms (~196 tok/s) |
+| NCCL init time (16 ranks across 2 nodes) | 0.28s |
+| GPU KV cache | 4,455,680 tokens |
+| Max concurrency (4096 tokens/req) | 1,087x |
+
+**Key finding:** The TCPXO shim's `guest_config_checker` requires additional configuration for non-NCCL-test workloads (it checks LLCM device availability and kernel tuning parameters). Multi-node vLLM was achieved by bypassing both the shim and tuner, using NCCL's built-in Socket transport for inter-node communication and NVLink P2P/CUMEM for intra-node.
+
+See `vllm-inference/vllm-tcpxo-deployment.yaml` for the working multi-node configuration.
 
 ---
 
@@ -400,7 +422,7 @@ For multi-node vLLM inference requiring TCPXO, use a vLLM container with matchin
 | RAM per Node | ~1.84 TB |
 | Interconnect (intra-node) | NVLink/NVSwitch (471 GB/s peak) |
 | Interconnect (inter-node, TCPXO) | GPUDirect-TCPXO FasTrak (188 GB/s peak) |
-| Interconnect (inter-node, TCP) | TCP/Socket over eth0 (3.7 GB/s) |
+| Interconnect (inter-node, TCP) | TCP/Socket over eth0 (3.6 GB/s) |
 | NCCL Plugin Version | `v1.0.15` (installer) / `v1.0.8` (FasTrak network plugin) |
 | NCCL Library | 2.28.7 (version code 22807) |
 | RxDM Version | `v1.0.21` (tcpgpudmarxd-dev) |

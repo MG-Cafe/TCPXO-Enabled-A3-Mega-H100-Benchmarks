@@ -8,19 +8,27 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 | Benchmark | Peak Bus Bandwidth | Speedup |
 |-----------|-------------------:|--------:|
 | Intra-node NVLink (8 GPUs) | **471.40 GB/s** | baseline |
-| Inter-node TCP (16 GPUs) | **3.74 GB/s** | 1x |
-| **Inter-node TCPXO (16 GPUs)** | **188.82 GB/s** | **~50x** |
+| Inter-node TCP (16 GPUs) | **3.60 GB/s** | 1x |
+| **Inter-node TCPXO (16 GPUs)** | **188.82 GB/s** | **~52x** |
 
-> GPUDirect-TCPXO delivers **188 GB/s** inter-node bandwidth — a **~50x speedup** over standard TCP networking.
+> GPUDirect-TCPXO delivers **188 GB/s** inter-node bandwidth — a **~52x speedup** over standard TCP networking.
 
 ### vLLM Inference on H100
+
+**Single-Node (8 GPUs, TP=8)**
 | Metric | Value |
 |--------|------:|
-| Model | Meta-Llama-3-8B (FP16) |
 | Peak Decode Speed | **132.3 tokens/sec** |
 | Peak Throughput (16 concurrent) | **10.43 req/sec** |
 | Time to First Token | **~420ms** |
-| Model Load Time | **29.7 seconds** |
+
+**Multi-Node (16 GPUs, TP=16, 2 nodes)**
+| Metric | Value |
+|--------|------:|
+| Single Request Latency (100 tokens) | **2,242ms (~45 tok/s)** |
+| Concurrent Throughput (10 reqs × 100 tokens) | **5,088ms (~196 tok/s)** |
+| NCCL Init (16 ranks, 2 nodes) | **0.28s** |
+| GPU KV Cache | **4,455,680 tokens** |
 
 ## 📋 Prerequisites
 
