@@ -393,12 +393,29 @@ We also deployed vLLM across **2 A3 Mega nodes** with **tensor parallelism = 16*
 - `NCCL_NET_PLUGIN=libnccl-nonexistent.so` — bypass TCPXO net shim
 - `NCCL_TUNER_PLUGIN=libnccl-tuner-nonexistent.so` — bypass A3x tuner plugin
 
+#### Single Request Latency (19 input tokens, 3 warmup iterations)
+
+| Max Tokens | Output Tokens | Latency (ms) | Decode Speed (tok/s) |
+|-----------:|--------------:|-------------:|---------------------:|
+| 50 | 50 | 1,176 | 42.5 |
+| 100 | 100 | 2,332 | 42.9 |
+| 200 | 200 | 4,687 | 42.7 |
+| 500 | 335† | 7,771 | 43.1 |
+
+*†Model hit EOS before reaching max_tokens.*
+
+#### Concurrent Request Throughput (100 output tokens per request, 3 iterations)
+
+| Concurrency | Total Output Tokens | Wall Time (ms) | Throughput (tok/s) |
+|------------:|--------------------:|---------------:|-------------------:|
+| 1 | 100 | 2,359 | 42.4 |
+| 4 | 400 | 2,609 | 153.3 |
+| 10 | 1,000 | 2,775 | **360.4** |
+
+#### System Metrics
+
 | Metric | Value |
 |--------|------:|
-| Single request latency (50 tokens) | 1,159ms (~43 tok/s) |
-| Single request latency (100 tokens) | 2,242ms (~45 tok/s) |
-| Single request latency (200 tokens) | 4,508ms (~44 tok/s) |
-| Concurrent throughput (10 reqs × 100 tokens) | 5,088ms (~196 tok/s) |
 | NCCL init time (16 ranks across 2 nodes) | 0.28s |
 | GPU KV cache | 4,455,680 tokens |
 | Max concurrency (4096 tokens/req) | 1,087x |

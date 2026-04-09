@@ -22,13 +22,22 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 | Peak Throughput (16 concurrent) | **10.43 req/sec** |
 | Time to First Token | **~420ms** |
 
-**Multi-Node (16 GPUs, TP=16, 2 nodes)**
-| Metric | Value |
-|--------|------:|
-| Single Request Latency (100 tokens) | **2,242ms (~45 tok/s)** |
-| Concurrent Throughput (10 reqs × 100 tokens) | **5,088ms (~196 tok/s)** |
-| NCCL Init (16 ranks, 2 nodes) | **0.28s** |
-| GPU KV Cache | **4,455,680 tokens** |
+**Multi-Node (16 GPUs, TP=16, 2 nodes) — 19 input tokens, 3 warmup iterations**
+
+| Output Tokens | Latency (ms) | Decode Speed (tok/s) |
+|--------------:|-------------:|---------------------:|
+| 50 | 1,176 | 42.5 |
+| 100 | 2,332 | 42.9 |
+| 200 | 4,687 | 42.7 |
+| 335† | 7,771 | 43.1 |
+
+| Concurrency | Output Tokens | Wall Time (ms) | Throughput (tok/s) |
+|------------:|--------------:|---------------:|-------------------:|
+| 1 | 100 | 2,359 | 42.4 |
+| 4 | 400 | 2,609 | 153.3 |
+| 10 | 1,000 | 2,775 | **360.4** |
+
+*†max_tokens=500, model hit EOS early. NCCL init: 0.28s, KV cache: 4.4M tokens.*
 
 ## 📋 Prerequisites
 
