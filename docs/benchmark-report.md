@@ -321,99 +321,73 @@ kubectl exec nccl-test-host-1 -c nccl-test -- bash -c \
 
 ---
 
-## vLLM Inference Benchmark
+## vLLM Inference Benchmark: GLM-5.1 (753B MoE)
 
 ### Overview
 
-To demonstrate real-world GPU workloads on the TCPXO-enabled A3 Mega cluster, we deployed [vLLM](https://github.com/vllm-project/vllm) v0.19.0 to serve the **Meta-Llama-3-8B** model (FP16) on a single H100 GPU.
+To demonstrate real-world multi-node GPU inference on the TCPXO-enabled A3 Mega cluster, we deployed [vLLM](https://github.com/vllm-project/vllm) v0.19.0 to serve **GLM-5.1** — a 753-billion-parameter Mixture-of-Experts model — across 2 A3 Mega nodes (16 H100 GPUs) using GPUDirect-TCPXO GDRDMA.
 
-**Key finding:** The TCPXO NCCL shim (`libnccl-net.so`) installed by the TCPXO installer conflicts with vLLM's bundled NCCL 2.27.5 (host has 2.28.7). Setting `NCCL_NET_PLUGIN=libnccl-nonexistent.so` bypasses the shim for intra-node workloads. See `vllm-inference/vllm-single-node.yaml` for the working configuration.
+### Model Details
+
+| Property | Value |
+|----------|-------|
+| Model | [zai-org/GLM-5.1](https://huggingface.co/zai-org/GLM-5.1) |
+| Parameters | 753B (Mixture of Experts) |
+| Architecture | `GlmMoeDsaForCausalLM` (MoE with Dense Attention) |
+| Max Context | 202,752 tokens |
+| Quantization | fp8 weights + fp8 KV cache |
+| Size on disk | ~1.5 TB |
+
+### Why fp8 Quantization is Required
+
+GLM-5.1 has 753B parameters. With TP=8, PP=2 (16 GPUs), each GPU holds ~47B params. In bf16 that's ~94 GB/GPU — exceeding the H100's 79 GiB HBM3. fp8 halves this to ~47 GB/GPU, leaving ~32 GB for KV cache. Without quantization, you'd need 3-4 nodes (PP=3 or PP=4).
 
 ### Deployment
 
 ```bash
-kubectl apply -f vllm-inference/vllm-single-node.yaml
-# Wait ~60 seconds for model download and loading
-kubectl logs vllm-inference --tail=3
+kubectl apply -f vllm-inference/vllm-glm-tcpxo.yaml
+
+# Wait for pods (both should show 2/2 Running — vllm + tcpxo-daemon sidecar)
+kubectl get pods -l tcpxo=daemon
+
+# Monitor model download (~1.5 TB, ~12 min)
+kubectl exec vllm-head -c vllm -- bash -c 'du -sh /root/.cache/huggingface/'
+
+# Wait for startup (~15 min total)
+kubectl logs vllm-head -c vllm --tail=5
 # Should show: "Application startup complete."
 ```
 
-### Inference Results
+### Configuration
 
-**Model:** NousResearch/Meta-Llama-3-8B (FP16, 14.96 GiB)
-**Engine:** vLLM v0.19.0, V1 engine, FlashAttention v3
-**GPU:** 1x NVIDIA H100 Mega 80GB
-**Model Load Time:** 29.7 seconds
-
-#### Single Request Latency (varying output length)
-
-| Max Tokens | Latency (ms) | Decode Speed (tokens/sec) |
-|-----------:|-------------:|--------------------------:|
-| 32 | 800 | 40.0 |
-| 64 | 919 | 69.6 |
-| 128 | 1,303 | 98.2 |
-| 256 | 2,211 | 115.8 |
-| 512 | 3,871 | 132.3 |
-
-**Peak decode speed:** 132.3 tokens/sec at 512 output tokens
-
-#### Concurrent Request Throughput
-
-| Concurrency | Total Requests | Total Time (ms) | Requests/sec | Avg Latency (ms) |
-|------------:|---------------:|----------------:|-------------:|------------------:|
-| 1 | 4 | 3,656 | 1.09 | 914 |
-| 4 | 16 | 3,961 | 4.04 | 248 |
-| 8 | 32 | 5,963 | 5.37 | 186 |
-| 16 | 64 | 6,134 | 10.43 | 96 |
-
-**Peak throughput:** 10.43 req/sec at concurrency 16
-
-#### Time to First Token (TTFT)
-
-| Prompt Length | TTFT (ms) |
-|--------------|----------:|
-| Short (1 token) | 442 |
-| Long (~50 tokens) | 407 |
-
-> **Note:** TTFT measurements include `kubectl exec` overhead (~300-400ms). Actual GPU-side TTFT is significantly lower.
-
-### NCCL Shim Compatibility Note
-
-On TCPXO-enabled A3 Mega nodes, the NCCL TCPXO installer places a network shim (`libnccl-net.so`) in the driver path that is auto-mounted into all GPU containers. This shim is compiled for NCCL 2.28.7, but vLLM v0.19.0 bundles NCCL 2.27.5 via PyTorch. The version mismatch causes `ncclCommInitRank` to fail with "NCCL internal error" when using tensor parallelism (TP > 1).
-
-**Workaround:** Set `NCCL_NET_PLUGIN=libnccl-nonexistent.so` as an environment variable. This causes NCCL to skip loading the external net plugin, falling back to built-in transports (NVLink for intra-node). This is appropriate for single-node inference where inter-node communication is not needed.
-
-### Multi-Node vLLM Inference (TP=16, 2 Nodes)
-
-We also deployed vLLM across **2 A3 Mega nodes** with **tensor parallelism = 16** using Ray as the distributed executor backend.
-
-**Configuration:** vLLM v0.19.0, Ray distributed executor, TP=16 across 2 A3 Mega nodes (16× H100), **GPUDirect-TCPXO GDRDMA** transport, enforce-eager mode, float16.
+- **Parallelism:** TP=8 (intra-node via NVLink) + PP=2 (inter-node via TCPXO GDRDMA)
+- **Engine:** vLLM v0.19.0, V1 engine, Ray distributed executor
+- **Transport:** GPUDirect-TCPXO GDRDMA (`NET/uninitialized_shim_v7/GDRDMA`)
+- **Mode:** enforce-eager, fp8 quantization, fp8 KV cache
 
 **Key approach — plugin-only (no host NCCL override):**
 - vLLM uses its own bundled **NCCL 2.27.5** (via PyTorch)
-- Only the TCPXO net plugin (`libnccl-net.so`) and tuner (`libnccl-tuner.so`) are mounted
+- Only the TCPXO net plugin (`libnccl-net.so`) and tuner (`libnccl-tuner.so`) are symlinked
 - **No `LD_PRELOAD`**, no host NCCL override — the shim's v7 API is compatible with NCCL 2.27.5+
-- Plugin files are symlinked into `/opt/nccl-plugins/` to avoid the host `libnccl.so` being loaded
+- Plugin files are placed in `/opt/nccl-plugins/` to avoid loading the host `libnccl.so`
 - `NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE` + all ENFORCED env vars are set
 
-#### Single Request Latency (GPUDirect-TCPXO GDRDMA)
+### Inference Results
+
+#### Single Request Latency
 
 | Output Tokens | Latency (ms) | Decode Speed (tok/s) |
 |--------------:|-------------:|---------------------:|
-| 50 | 1,301 | 38.4 |
-| 100 | 2,391 | 41.8 |
-| 200 | 4,558 | **43.9** |
-| 391† | 8,903 | **43.9** |
+| 50 | 12,121 | 4.1 |
+| 100 | 22,040 | 4.5 |
+| 200 | 44,370 | **4.5** |
 
-*†max_tokens=500, model hit EOS early.*
+#### Concurrent Request Throughput
 
-#### Concurrent Request Throughput (GPUDirect-TCPXO GDRDMA)
-
-| Concurrency | Total Output Tokens | Wall Time (ms) | Throughput (tok/s) |
-|------------:|--------------------:|---------------:|-------------------:|
-| 1 | 100 | 2,358 | 42.4 |
-| 4 | 400 | 2,530 | 158.1 |
-| 10 | 1,000 | 4,827 | **207.2** |
+| Concurrency | Output Tokens | Engine Throughput (tok/s) |
+|------------:|--------------:|-------------------------:|
+| 1 | 100 | 4.5 |
+| 4 | 400 | **5.9** |
 
 #### System Metrics
 
@@ -423,9 +397,26 @@ We also deployed vLLM across **2 A3 Mega nodes** with **tensor parallelism = 16*
 | Inter-node transport | `NET/uninitialized_shim_v7/GDRDMA` |
 | TCPXO shim API | v7 |
 | Host NCCL (installer) | 2.28.7 |
-| GPU KV cache | 4,455,680 tokens |
+| GPU KV cache | 858,048 tokens |
+| Max concurrency (202K context) | 4.23× |
+| Weight download (HuggingFace) | 694s (~1.5 TB) |
+| Weight loading (worker → GPU) | 48s |
+| Weight loading (head → GPU) | 87s |
+| Total startup time | ~15 min |
 
-#### Key Finding: Plugin-Only Approach
+### How Data is Sharded (TP=8 + PP=2)
+
+**Pipeline Parallelism (PP=2)** splits layers between nodes:
+- Node 1 (vllm-head): ~first half of transformer layers + embedding
+- Node 2 (vllm-worker): ~second half of layers + output head
+- Only intermediate activations (hidden states) cross the inter-node TCPXO link — weights stay local
+
+**Tensor Parallelism (TP=8)** splits each layer across 8 GPUs within a node:
+- Attention Q/K/V matrices split column-wise (each GPU gets 1/8 of attention heads)
+- MoE experts distributed across GPUs
+- All-reduce after each layer via NVLink (471 GB/s)
+
+### Key Finding: Plugin-Only TCPXO Approach
 
 The correct approach for integrating TCPXO with third-party GPU workloads (vLLM, PyTorch training, etc.) is to **mount only the net plugin**, not replace the entire NCCL library:
 
@@ -437,7 +428,7 @@ The correct approach for integrating TCPXO with third-party GPU workloads (vLLM,
 
 This avoids ABI issues from NCCL version mismatches while still enabling full TCPXO GDRDMA transport.
 
-See `vllm-inference/vllm-tcpxo-deployment.yaml` for the working multi-node configuration.
+See `vllm-inference/vllm-glm-tcpxo.yaml` for the working multi-node configuration.
 
 ---
 
