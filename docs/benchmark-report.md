@@ -393,34 +393,45 @@ We also deployed vLLM across **2 A3 Mega nodes** with **tensor parallelism = 16*
 - `NCCL_NET_PLUGIN=libnccl-nonexistent.so` — bypass TCPXO net shim
 - `NCCL_TUNER_PLUGIN=libnccl-tuner-nonexistent.so` — bypass A3x tuner plugin
 
-#### Single Request Latency (19 input tokens, 3 warmup iterations)
+#### Single Request Latency — Socket vs TCPXO GDRDMA
 
-| Max Tokens | Output Tokens | Latency (ms) | Decode Speed (tok/s) |
-|-----------:|--------------:|-------------:|---------------------:|
-| 50 | 50 | 1,176 | 42.5 |
-| 100 | 100 | 2,332 | 42.9 |
-| 200 | 200 | 4,687 | 42.7 |
-| 500 | 335† | 7,771 | 43.1 |
+| Output Tokens | Socket Decode (tok/s) | **TCPXO GDRDMA Decode (tok/s)** |
+|--------------:|----------------------:|--------------------------------:|
+| 50 | 42.5 | 39.5 |
+| 100 | 42.9 | 39.3 |
+| 200 | 42.7 | 38.3 |
+| 391† | — | 37.1 |
 
-*†Model hit EOS before reaching max_tokens.*
+*†max_tokens=500, model hit EOS early.*
 
-#### Concurrent Request Throughput (100 output tokens per request, 3 iterations)
+#### Concurrent Request Throughput — Socket vs TCPXO GDRDMA
 
-| Concurrency | Total Output Tokens | Wall Time (ms) | Throughput (tok/s) |
-|------------:|--------------------:|---------------:|-------------------:|
-| 1 | 100 | 2,359 | 42.4 |
-| 4 | 400 | 2,609 | 153.3 |
-| 10 | 1,000 | 2,775 | **360.4** |
+| Concurrency | Socket (tok/s) | **TCPXO GDRDMA (tok/s)** |
+|------------:|---------------:|-------------------------:|
+| 1 | 42.4 | 35.9 |
+| 4 | 153.3 | 142.1 |
+| 10 | **360.4** | 192.2 |
 
 #### System Metrics
 
-| Metric | Value |
-|--------|------:|
-| NCCL init time (16 ranks across 2 nodes) | 0.28s |
-| GPU KV cache | 4,455,680 tokens |
-| Max concurrency (4096 tokens/req) | 1,087x |
+| Metric | Socket | TCPXO GDRDMA |
+|--------|-------:|-------------:|
+| NCCL init (16 ranks, 2 nodes) | 0.28s | 0.35s |
+| Inter-node transport | `NET/Socket` | `NET/uninitialized_shim_v7/GDRDMA` |
+| GPU KV cache | 4,455,680 tokens | 4,455,680 tokens |
 
-**Key finding:** The TCPXO shim's `guest_config_checker` requires additional configuration for non-NCCL-test workloads (it checks LLCM device availability and kernel tuning parameters). Multi-node vLLM was achieved by bypassing both the shim and tuner, using NCCL's built-in Socket transport for inter-node communication and NVLink P2P/CUMEM for intra-node.
+#### Key Finding: TCPXO vs Socket for Small-Model Inference
+
+For this small **8B model with TP=16**, Socket transport actually outperforms TCPXO GDRDMA for inference:
+
+- With only ~0.5B params per GPU, the **activation tensors exchanged between nodes are tiny** (KBs, not GBs)
+- TCPXO's GDRDMA has higher **per-operation setup overhead** (DMA buffer registration, flow establishment)
+- Socket transport has **lower latency for small messages** despite lower peak bandwidth
+- TCPXO's **52x bandwidth advantage** (188 vs 3.6 GB/s) manifests only at large message sizes (>16MB)
+
+**When TCPXO matters for inference:** For much larger models (70B, 405B) where tensor shards per GPU are substantial, or for training workloads where gradient all-reduce involves gigabytes of data, TCPXO's bandwidth advantage becomes critical.
+
+**The TCPXO shim's `guest_config_checker`** requires `NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE` pointing to `a3plus_guest_config.textproto`, plus all ENFORCED env vars (see `vllm-tcpxo-deployment.yaml`). Using `LD_PRELOAD=/usr/local/nvidia/lib64/libnccl.so.2` forces host NCCL 2.28.7 to match the shim version.
 
 See `vllm-inference/vllm-tcpxo-deployment.yaml` for the working multi-node configuration.
 

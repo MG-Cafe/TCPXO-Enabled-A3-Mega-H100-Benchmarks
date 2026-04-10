@@ -22,22 +22,24 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 | Peak Throughput (16 concurrent) | **10.43 req/sec** |
 | Time to First Token | **~420ms** |
 
-**Multi-Node (16 GPUs, TP=16, 2 nodes) — 19 input tokens, 3 warmup iterations**
+**Multi-Node (16 GPUs, TP=16, 2 nodes) — TCPXO GDRDMA vs Socket**
 
-| Output Tokens | Latency (ms) | Decode Speed (tok/s) |
-|--------------:|-------------:|---------------------:|
-| 50 | 1,176 | 42.5 |
-| 100 | 2,332 | 42.9 |
-| 200 | 4,687 | 42.7 |
-| 335† | 7,771 | 43.1 |
+| Output Tokens | Socket (tok/s) | **TCPXO GDRDMA (tok/s)** |
+|--------------:|---------------:|-------------------------:|
+| 50 | 42.5 | 39.5 |
+| 100 | 42.9 | 39.3 |
+| 200 | 42.7 | 38.3 |
+| 391† | — | 37.1 |
 
-| Concurrency | Output Tokens | Wall Time (ms) | Throughput (tok/s) |
-|------------:|--------------:|---------------:|-------------------:|
-| 1 | 100 | 2,359 | 42.4 |
-| 4 | 400 | 2,609 | 153.3 |
-| 10 | 1,000 | 2,775 | **360.4** |
+| Concurrency | Socket (tok/s) | **TCPXO GDRDMA (tok/s)** |
+|------------:|---------------:|-------------------------:|
+| 1 | 42.4 | 35.9 |
+| 4 | 153.3 | 142.1 |
+| 10 | **360.4** | 192.2 |
 
-*†max_tokens=500, model hit EOS early. NCCL init: 0.28s, KV cache: 4.4M tokens.*
+*†max_tokens=500, model hit EOS early.*
+
+> **Key insight:** For this small 8B model with TP=16, Socket outperforms TCPXO for inference. With only ~0.5B params per GPU, the activation tensors are tiny — TCPXO's GDRDMA setup overhead exceeds the transfer time savings. TCPXO's **52x bandwidth advantage** (188 vs 3.6 GB/s) shines with large bulk transfers during **training** or inference of much larger models (70B+) where tensor shards are substantial.
 
 ## 📋 Prerequisites
 

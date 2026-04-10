@@ -1,12 +1,9 @@
-# vLLM Distributed Inference across 2 A3 Mega nodes (16x H100 GPUs)
-# Uses Ray for multi-node coordination with tensor parallelism
+# vLLM Distributed Inference with GPUDirect-TCPXO on A3 Mega
+# 2 nodes × 8 H100 GPUs = TP=16 with full TCPXO inter-node bandwidth (~188 GB/s)
 #
-# Architecture: TP=16 across 2 nodes (8 GPUs each)
-# Inter-node: NCCL Socket transport | Intra-node: NVLink P2P/CUMEM
-#
-# Key env vars to bypass GKE's TCPXO shim/tuner (which require additional config):
-#   NCCL_NET_PLUGIN=libnccl-nonexistent.so     - bypass TCPXO net shim
-#   NCCL_TUNER_PLUGIN=libnccl-tuner-nonexistent.so - bypass A3x tuner
+# Key: Uses host NCCL 2.28.7 (via LD_PRELOAD) to match TCPXO shim version.
+# vLLM bundles NCCL 2.27.5 which is incompatible with the shim.
+# All NCCL_FASTRAK_* env vars from official nccl-test-latest.yaml are included.
 
 apiVersion: v1
 kind: Service
@@ -141,13 +138,59 @@ spec:
             --dtype float16 \
             --enforce-eager 2>&1
       env:
-        # Bypass TCPXO shim and tuner, use vLLM's bundled NCCL with Socket transport
-        - name: NCCL_NET_PLUGIN
-          value: libnccl-nonexistent.so
-        - name: NCCL_TUNER_PLUGIN
-          value: libnccl-tuner-nonexistent.so
+        # Force host NCCL 2.28.7 (matches TCPXO shim) instead of vLLM's bundled 2.27.5
+        - name: LD_PRELOAD
+          value: /usr/local/nvidia/lib64/libnccl.so.2
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+        # Guest config checker config file (required by TCPXO shim)
+        - name: NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE
+          value: /usr/local/nvidia/lib64/a3plus_guest_config.textproto
+        # TCPXO FasTrak configuration — all ENFORCED vars from guest_config_checker
+        - name: NCCL_FASTRAK_CTRL_DEV
+          value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
+        - name: NCCL_FASTRAK_IFNAME
+          value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
         - name: NCCL_SOCKET_IFNAME
           value: eth0
+        - name: NCCL_CROSS_NIC
+          value: "0"
+        - name: NCCL_PROTO
+          value: "Simple,LL128"
+        - name: NCCL_MIN_NCHANNELS
+          value: "4"
+        - name: NCCL_NVLSTREE_MAX_CHUNKSIZE
+          value: "131072"
+        - name: NCCL_P2P_NET_CHUNKSIZE
+          value: "524288"
+        - name: NCCL_P2P_PCI_CHUNKSIZE
+          value: "524288"
+        - name: NCCL_P2P_NVL_CHUNKSIZE
+          value: "1048576"
+        - name: NCCL_FASTRAK_NUM_FLOWS
+          value: "2"
+        - name: NCCL_FASTRAK_USE_SNAP
+          value: "1"
+        - name: NCCL_FASTRAK_ENABLE_CONTROL_CHANNEL
+          value: "0"
+        - name: NCCL_BUFFSIZE
+          value: "8388608"
+        - name: NCCL_NET_GDR_LEVEL
+          value: PIX
+        - name: NCCL_FASTRAK_ENABLE_HOTPATH_LOGGING
+          value: "0"
+        - name: NCCL_FASTRAK_USE_LLCM
+          value: "1"
+        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
+          value: /dev/aperture_devices
+        # Recommended by guest_config_checker
+        - name: NCCL_TUNER_PLUGIN
+          value: libnccl-tuner.so
+        - name: NCCL_TUNER_CONFIG_PATH
+          value: /usr/local/nvidia/lib64/a3plus_tuner_config.textproto
+        - name: NCCL_FASTRAK_PLUGIN_ACCEPT_TIMEOUT_MS
+          value: "600000"
+        # vLLM / Ray settings
         - name: NCCL_DEBUG
           value: INFO
         - name: RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
@@ -155,8 +198,12 @@ spec:
         - name: VLLM_USE_V1
           value: "0"
       volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
         - name: shared-memory
           mountPath: /dev/shm
+        - name: aperture-devices
+          mountPath: /dev/aperture_devices
         - name: model-cache
           mountPath: /root/.cache
       resources:
@@ -184,6 +231,9 @@ spec:
     - name: proc-sys
       hostPath:
         path: /proc/sys
+    - name: aperture-devices
+      hostPath:
+        path: /dev/aperture_devices
     - name: model-cache
       emptyDir: {}
 ---
@@ -269,19 +319,65 @@ spec:
           # Connect to Ray head node and block
           ray start --address=vllm-head:6379 --block
       env:
-        - name: NCCL_NET_PLUGIN
-          value: libnccl-nonexistent.so
-        - name: NCCL_TUNER_PLUGIN
-          value: libnccl-tuner-nonexistent.so
+        - name: LD_PRELOAD
+          value: /usr/local/nvidia/lib64/libnccl.so.2
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+        - name: NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE
+          value: /usr/local/nvidia/lib64/a3plus_guest_config.textproto
+        - name: NCCL_FASTRAK_CTRL_DEV
+          value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
+        - name: NCCL_FASTRAK_IFNAME
+          value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
         - name: NCCL_SOCKET_IFNAME
           value: eth0
+        - name: NCCL_CROSS_NIC
+          value: "0"
+        - name: NCCL_PROTO
+          value: "Simple,LL128"
+        - name: NCCL_MIN_NCHANNELS
+          value: "4"
+        - name: NCCL_NVLSTREE_MAX_CHUNKSIZE
+          value: "131072"
+        - name: NCCL_P2P_NET_CHUNKSIZE
+          value: "524288"
+        - name: NCCL_P2P_PCI_CHUNKSIZE
+          value: "524288"
+        - name: NCCL_P2P_NVL_CHUNKSIZE
+          value: "1048576"
+        - name: NCCL_FASTRAK_NUM_FLOWS
+          value: "2"
+        - name: NCCL_FASTRAK_USE_SNAP
+          value: "1"
+        - name: NCCL_FASTRAK_ENABLE_CONTROL_CHANNEL
+          value: "0"
+        - name: NCCL_BUFFSIZE
+          value: "8388608"
+        - name: NCCL_NET_GDR_LEVEL
+          value: PIX
+        - name: NCCL_FASTRAK_ENABLE_HOTPATH_LOGGING
+          value: "0"
+        - name: NCCL_FASTRAK_USE_LLCM
+          value: "1"
+        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
+          value: /dev/aperture_devices
+        - name: NCCL_TUNER_PLUGIN
+          value: libnccl-tuner.so
+        - name: NCCL_TUNER_CONFIG_PATH
+          value: /usr/local/nvidia/lib64/a3plus_tuner_config.textproto
+        - name: NCCL_FASTRAK_PLUGIN_ACCEPT_TIMEOUT_MS
+          value: "600000"
         - name: NCCL_DEBUG
           value: INFO
         - name: RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
           value: "1"
       volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
         - name: shared-memory
           mountPath: /dev/shm
+        - name: aperture-devices
+          mountPath: /dev/aperture_devices
         - name: model-cache
           mountPath: /root/.cache
       resources:
@@ -305,5 +401,8 @@ spec:
     - name: proc-sys
       hostPath:
         path: /proc/sys
+    - name: aperture-devices
+      hostPath:
+        path: /dev/aperture_devices
     - name: model-cache
       emptyDir: {}
