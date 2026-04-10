@@ -5,6 +5,7 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 ## 🚀 Results at a Glance
 
 ### NCCL Communication Benchmarks
+
 | Benchmark | Peak Bus Bandwidth | Speedup |
 |-----------|-------------------:|--------:|
 | Intra-node NVLink (8 GPUs) | **471.40 GB/s** | baseline |
@@ -13,40 +14,16 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 
 > GPUDirect-TCPXO delivers **188 GB/s** inter-node bandwidth — a **~52x speedup** over standard TCP networking.
 
-### vLLM Inference on H100
+### GLM-5.1 (753B MoE) — Multi-Node Inference with GPUDirect-TCPXO GDRDMA
 
-**Single-Node (1 GPU, Llama-3-8B)**
-| Metric | Value |
-|--------|------:|
-| Peak Decode Speed | **132.3 tokens/sec** |
-| Peak Throughput (16 concurrent) | **10.43 req/sec** |
-| Time to First Token | **~420ms** |
+**Config:** 2 nodes × 8 H100 GPUs (16 total)
+- **Parallelism:** TP=8 (intra-node via NVLink) + PP=2 (inter-node via TCPXO GDRDMA)
+- **Quantization:** fp8 weights + fp8 KV cache (required for 753B on 16 GPUs)
+- **Max context:** 202,752 tokens
+- **Architecture:** `GlmMoeDsaForCausalLM` (Mixture of Experts with Dense Attention)
+- **vLLM engine:** V1 with Ray multi-node orchestration
 
-**Multi-Node (16 GPUs, TP=16, 2 nodes) — GPUDirect-TCPXO GDRDMA**
-
-| Output Tokens | Latency (ms) | Decode Speed (tok/s) |
-|--------------:|-------------:|---------------------:|
-| 50 | 1,301 | 38.4 |
-| 100 | 2,391 | 41.8 |
-| 200 | 4,558 | **43.9** |
-| 391† | 8,903 | **43.9** |
-
-| Concurrency | Output Tokens | Wall Time (ms) | Throughput (tok/s) |
-|------------:|--------------:|---------------:|-------------------:|
-| 1 | 100 | 2,358 | 42.4 |
-| 4 | 400 | 2,530 | 158.1 |
-| 10 | 1,000 | 4,827 | **207.2** |
-
-*†max_tokens=500, model hit EOS early.*
-
-> **Setup:** vLLM uses its own bundled NCCL 2.27.5 (NOT the host's 2.28.7). Only the TCPXO net plugin (`libnccl-net.so`) and tuner are mounted — no `LD_PRELOAD`, no host NCCL override. The TCPXO shim's v7 API is compatible with NCCL 2.27.5+. See `vllm-inference/vllm-tcpxo-deployment.yaml`.
-
-### GLM-5.1 (753B MoE) — Multi-Node with GPUDirect-TCPXO GDRDMA
-
-**Config:** 2 nodes × 8 H100 = TP=8 (intra-node NVLink), PP=2 (inter-node TCPXO GDRDMA)
-- Quantization: fp8 weights + fp8 KV cache
-- Max context: 202,752 tokens
-- Architecture: `GlmMoeDsaForCausalLM` (Mixture of Experts with Dense Attention)
+#### Single-Request Latency
 
 | Output Tokens | Latency (ms) | Decode Speed (tok/s) |
 |--------------:|-------------:|---------------------:|
@@ -54,18 +31,27 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 | 100 | 22,040 | 4.5 |
 | 200 | 44,370 | **4.5** |
 
+#### Concurrent Throughput
+
 | Concurrency | Output Tokens | Engine Throughput (tok/s) |
 |------------:|--------------:|-------------------------:|
 | 1 | 100 | 4.5 |
 | 4 | 400 | **5.9** |
 
-> **Key achievements:**
-> - Successfully loaded a **753B MoE** model across 2 nodes with fp8 quantization
-> - GPUDirect-TCPXO GDRDMA channels established on all 16 GPUs (`shim_v7`)
-> - GPU KV cache: 858,048 tokens (4.23× concurrency at 202K context)
-> - Weight loading: 48s (worker) / 87s (head) after 694s download
-> - The pipeline parallelism inter-node communication uses TCPXO's 188 GB/s bandwidth
-> - See `vllm-inference/vllm-glm-tcpxo.yaml`
+#### Key Metrics
+
+| Metric | Value |
+|--------|------:|
+| GPU KV Cache | **858,048 tokens** |
+| Max Concurrency (202K context) | **4.23×** |
+| Weight Download (HuggingFace) | **694s (~1.5 TB)** |
+| Weight Loading (worker → GPU) | **48s** |
+| Weight Loading (head → GPU) | **87s** |
+| Total Startup Time | **~15 min** |
+
+> **TCPXO plugin-only approach:** vLLM uses its own bundled NCCL 2.27.5 (NOT the host's 2.28.7). Only the TCPXO net plugin (`libnccl-net.so`) and tuner are mounted — no `LD_PRELOAD`, no host NCCL override. The TCPXO shim's v7 API is compatible with NCCL 2.27.5+.
+
+> **Why fp8 quantization is required:** GLM-5.1 has 753B parameters. With TP=8, PP=2 (16 GPUs), each GPU holds ~47B params. In bf16 that's ~94 GB/GPU — exceeding the H100's 79 GiB. fp8 halves this to ~47 GB/GPU, leaving ~32 GB for KV cache. Without quantization, you'd need 3-4 nodes (PP=3 or PP=4).
 
 ## 📋 Prerequisites
 
@@ -195,18 +181,15 @@ kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container
 kubectl get pods -n kube-system | grep device-injector
 ```
 
-### 8. Deploy NCCL Test Workload
+### 8. Run NCCL Benchmarks (Optional)
 
 ```bash
+# Deploy NCCL test workload
 kubectl apply -f https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/gpudirect-tcpxo/nccl-test-latest.yaml
 
-# Wait for pods to be ready (both should show 2/2 Running)
+# Wait for pods (both should show 2/2 Running)
 kubectl get pods -l tcpxo=daemon
-```
 
-### 9. Run the NCCL Benchmark
-
-```bash
 # Set up SSH between pods
 kubectl exec nccl-test-host-1 -c nccl-test -- bash -c \
   '/scripts/init_ssh.sh host1.nccl-host-1.default.svc.cluster.local host2.nccl-host-2.default.svc.cluster.local'
@@ -236,12 +219,64 @@ kubectl exec nccl-test-host-1 -c nccl-test -- bash -c \
   'BENCHMARK=all_gather_perf NHOSTS=2 NCCL_LIB_DIR="/usr/local/nvidia/lib64" LD_LIBRARY_PATH="/usr/local/nvidia/lib64" /scripts/demo-run-nccl-test-tcpxo-via-mpi.sh'
 ```
 
+### 9. Deploy GLM-5.1 (753B MoE) with TCPXO
+
+```bash
+# Deploy the GLM-5.1 multi-node inference workload
+kubectl apply -f vllm-inference/vllm-glm-tcpxo.yaml
+
+# Wait for pods (both should show 2/2 Running — vllm + tcpxo-daemon sidecar)
+kubectl get pods -l tcpxo=daemon
+
+# Monitor model download progress (~1.5 TB, ~12 min)
+kubectl exec vllm-head -c vllm -- bash -c 'du -sh /root/.cache/huggingface/'
+
+# Check for TCPXO GDRDMA confirmation in logs
+kubectl logs vllm-head -c vllm 2>&1 | grep -i "GDRDMA\|shim_v7\|Application startup"
+
+# Wait for "Application startup complete" (~15 min total)
+kubectl logs vllm-head -c vllm --tail=5
+
+# Port-forward for API access
+kubectl port-forward pod/vllm-head 8000:8000
+
+# Test inference
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"zai-org/GLM-5.1","messages":[{"role":"user","content":"Explain quantum computing."}],"max_tokens":100}'
+```
+
+#### Expected Log Confirmations
+
+You should see these in `kubectl logs vllm-head -c vllm`:
+
+```
+# TCPXO plugin loaded on all GPUs
+NCCL INFO NET/Plugin: Loaded net plugin uninitialized_shim_v7 (v7) [repeated 15x across cluster]
+NCCL INFO Successfully loaded external plugin libnccl-net.so
+NCCL INFO Initialized NET plugin uninitialized_shim_v7
+
+# GDRDMA channels established between nodes
+NCCL INFO Channel 00/0 : 1[1] -> 0[1] [receive] via NET/uninitialized_shim_v7/1/GDRDMA
+NCCL INFO Channel 00/0 : 0[1] -> 1[1] [send] via NET/uninitialized_shim_v7/1/GDRDMA
+
+# Model loaded and serving
+Loading weights took 48.02 seconds  (worker)
+Loading weights took 86.91 seconds  (head)
+GPU KV cache size: 858,048 tokens
+Maximum concurrency for 202,752 tokens per request: 4.23x
+Application startup complete.
+```
+
 ## 🧹 Cleanup
 
 ```bash
-# Delete workload
-kubectl delete pod nccl-test-host-1 nccl-test-host-2
-kubectl delete svc nccl-host-1 nccl-host-2
+# Delete GLM workload
+kubectl delete -f vllm-inference/vllm-glm-tcpxo.yaml
+
+# Delete NCCL test pods (if deployed)
+kubectl delete pod nccl-test-host-1 nccl-test-host-2 2>/dev/null
+kubectl delete svc nccl-host-1 nccl-host-2 2>/dev/null
 
 # Delete DaemonSets
 kubectl delete -f https://raw.githubusercontent.com/GoogleCloudPlatform/container-engine-accelerators/master/nri_device_injector/nri-device-injector.yaml
@@ -262,30 +297,28 @@ done
 
 | File | Description |
 |------|-------------|
-| `README.md` | This step-by-step setup guide |
-| `docs/benchmark-report.md` | Detailed NCCL benchmark report with all results and architecture deep-dive |
-| `vllm-inference/vllm-single-node.yaml` | Single-node Llama-3-8B Pod spec (1 GPU, TP=1) |
-| `vllm-inference/vllm-tcpxo-deployment.yaml` | Multi-node Llama-3-8B with TCPXO (TP=16, PP=1) |
-| `vllm-inference/vllm-glm-tcpxo.yaml` | Multi-node GLM-5.1 753B MoE with TCPXO (TP=8, PP=2, fp8) |
-| `vllm-inference/run-benchmark.sh` | Inference benchmark script (latency, throughput, TTFT) |
-| `vllm-inference/benchmark-results.txt` | Raw benchmark output (Llama-3-8B single-node) |
+| `README.md` | This setup guide with benchmark results |
+| `docs/benchmark-report.md` | Detailed NCCL benchmark report with architecture deep-dive |
+| `vllm-inference/vllm-glm-tcpxo.yaml` | GLM-5.1 753B MoE multi-node deployment (TP=8, PP=2, fp8) |
 
 ## 🔗 References
 
 - [GCP: Maximize GPU network bandwidth in Standard mode clusters](https://cloud.google.com/kubernetes-engine/docs/how-to/gpu-bandwidth-gpudirect-tcpx)
 - [GoogleCloudPlatform/container-engine-accelerators (GitHub)](https://github.com/GoogleCloudPlatform/container-engine-accelerators/tree/master/gpudirect-tcpxo)
 - [NVIDIA NCCL Documentation](https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/)
+- [GLM-5.1 on HuggingFace](https://huggingface.co/zai-org/GLM-5.1)
 
 ## 📊 Software Versions
 
 | Component | Version |
 |-----------|---------|
 | GKE | 1.33.10-gke.1067000 |
-| NCCL | 2.28.7 |
+| NCCL (host) | 2.28.7 |
+| NCCL (vLLM bundled) | 2.27.5 (via PyTorch) |
 | NCCL TCPXO Installer | v1.0.15 |
 | FasTrak Network Plugin | v1.0.8 |
 | RxDM (tcpgpudmarxd) | v1.0.21 |
 | GPU | NVIDIA H100 Mega 80GB HBM3 |
 | Machine Type | a3-megagpu-8g |
 | vLLM | 0.19.0 (V1 engine) |
-| vLLM NCCL | 2.27.5 (bundled via PyTorch) |
+| Model | GLM-5.1 (753B MoE) |
