@@ -168,8 +168,9 @@ spec:
             --port 8000 \
             --max-model-len 202752 \
             --max-num-seqs 2 \
-            --gpu-memory-utilization 0.8 \
+            --gpu-memory-utilization 0.95 \
             --kv-cache-dtype fp8 \
+            --quantization fp8 \
             --trust-remote-code \
             --dtype auto \
             --enforce-eager 2>&1

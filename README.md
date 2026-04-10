@@ -41,6 +41,32 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 
 > **Setup:** vLLM uses its own bundled NCCL 2.27.5 (NOT the host's 2.28.7). Only the TCPXO net plugin (`libnccl-net.so`) and tuner are mounted — no `LD_PRELOAD`, no host NCCL override. The TCPXO shim's v7 API is compatible with NCCL 2.27.5+. See `vllm-inference/vllm-tcpxo-deployment.yaml`.
 
+### GLM-5.1 (753B MoE) — Multi-Node with GPUDirect-TCPXO GDRDMA
+
+**Config:** 2 nodes × 8 H100 = TP=8 (intra-node NVLink), PP=2 (inter-node TCPXO GDRDMA)
+- Quantization: fp8 weights + fp8 KV cache
+- Max context: 202,752 tokens
+- Architecture: `GlmMoeDsaForCausalLM` (Mixture of Experts with Dense Attention)
+
+| Output Tokens | Latency (ms) | Decode Speed (tok/s) |
+|--------------:|-------------:|---------------------:|
+| 50 | 12,121 | 4.1 |
+| 100 | 22,040 | 4.5 |
+| 200 | 44,370 | **4.5** |
+
+| Concurrency | Output Tokens | Engine Throughput (tok/s) |
+|------------:|--------------:|-------------------------:|
+| 1 | 100 | 4.5 |
+| 4 | 400 | **5.9** |
+
+> **Key achievements:**
+> - Successfully loaded a **753B MoE** model across 2 nodes with fp8 quantization
+> - GPUDirect-TCPXO GDRDMA channels established on all 16 GPUs (`shim_v7`)
+> - GPU KV cache: 858,048 tokens (4.23× concurrency at 202K context)
+> - Weight loading: 48s (worker) / 87s (head) after 694s download
+> - The pipeline parallelism inter-node communication uses TCPXO's 188 GB/s bandwidth
+> - See `vllm-inference/vllm-glm-tcpxo.yaml`
+
 ## 📋 Prerequisites
 
 - Google Cloud project with GPU quota for `a3-megagpu-8g` in your target region
