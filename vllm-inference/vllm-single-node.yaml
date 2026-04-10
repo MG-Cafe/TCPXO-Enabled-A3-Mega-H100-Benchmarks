@@ -44,7 +44,7 @@ spec:
           mountPath: /dev/shm
       resources:
         limits:
-          nvidia.com/gpu: 8
+          nvidia.com/gpu: 1
       ports:
         - containerPort: 8000
   nodeSelector:

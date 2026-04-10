@@ -15,7 +15,7 @@ End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Goog
 
 ### vLLM Inference on H100
 
-**Single-Node (8 GPUs, TP=8)**
+**Single-Node (1 GPU, Llama-3-8B)**
 | Metric | Value |
 |--------|------:|
 | Peak Decode Speed | **132.3 tokens/sec** |
@@ -264,10 +264,11 @@ done
 |------|-------------|
 | `README.md` | This step-by-step setup guide |
 | `docs/benchmark-report.md` | Detailed NCCL benchmark report with all results and architecture deep-dive |
-| `vllm-inference/vllm-single-node.yaml` | Kubernetes Pod spec for vLLM on A3 Mega H100 |
-| `vllm-inference/vllm-tcpxo-deployment.yaml` | Multi-node vLLM deployment with TCPXO (experimental) |
+| `vllm-inference/vllm-single-node.yaml` | Single-node Llama-3-8B Pod spec (1 GPU, TP=1) |
+| `vllm-inference/vllm-tcpxo-deployment.yaml` | Multi-node Llama-3-8B with TCPXO (TP=16, PP=1) |
+| `vllm-inference/vllm-glm-tcpxo.yaml` | Multi-node GLM-5.1 753B MoE with TCPXO (TP=8, PP=2, fp8) |
 | `vllm-inference/run-benchmark.sh` | Inference benchmark script (latency, throughput, TTFT) |
-| `vllm-inference/benchmark-results.txt` | Raw benchmark output |
+| `vllm-inference/benchmark-results.txt` | Raw benchmark output (Llama-3-8B single-node) |
 
 ## 🔗 References
 
