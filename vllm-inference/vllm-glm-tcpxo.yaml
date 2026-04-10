@@ -1,0 +1,453 @@
+# vLLM Inference: GLM-5.1 (753B MoE) with GPUDirect-TCPXO on A3 Mega
+# Customer configuration: 2 nodes × 8 H100 = TP=8, PP=2
+#
+# Architecture: glm_moe_dsa (Mixture of Experts with Dense Attention)
+# - TP=8 within each node (NVLink/NVSwitch, 471 GB/s)
+# - PP=2 across nodes (GPUDirect-TCPXO GDRDMA, 188 GB/s)
+# - Pipeline parallelism sends intermediate activations between nodes
+#   → TCPXO's bandwidth advantage is critical for this workload
+#
+# Plugin-only TCPXO approach:
+#   vLLM uses its own NCCL (2.27.5 via PyTorch). Only the TCPXO net
+#   plugin (libnccl-net.so) and tuner are symlinked into /opt/nccl-plugins/.
+#   No LD_PRELOAD, no host NCCL override.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-head-svc
+spec:
+  selector:
+    name: vllm-head
+  clusterIP: None
+  ports:
+    - name: ray-client
+      port: 10001
+    - name: ray-dashboard
+      port: 8265
+    - name: ray-gcs
+      port: 6379
+    - name: vllm-api
+      port: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-worker-svc
+spec:
+  selector:
+    name: vllm-worker
+  clusterIP: None
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-head
+  labels:
+    name: vllm-head
+    tcpxo: daemon
+  annotations:
+    devices.gke.io/container.tcpxo-daemon: |+
+      - path: /dev/nvidia0
+      - path: /dev/nvidia1
+      - path: /dev/nvidia2
+      - path: /dev/nvidia3
+      - path: /dev/nvidia4
+      - path: /dev/nvidia5
+      - path: /dev/nvidia6
+      - path: /dev/nvidia7
+      - path: /dev/nvidiactl
+      - path: /dev/nvidia-uvm
+      - path: /dev/dmabuf_import_helper
+    networking.gke.io/default-interface: 'eth0'
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"eth1","network":"vpc1"},
+        {"interfaceName":"eth2","network":"vpc2"},
+        {"interfaceName":"eth3","network":"vpc3"},
+        {"interfaceName":"eth4","network":"vpc4"},
+        {"interfaceName":"eth5","network":"vpc5"},
+        {"interfaceName":"eth6","network":"vpc6"},
+        {"interfaceName":"eth7","network":"vpc7"},
+        {"interfaceName":"eth8","network":"vpc8"}
+      ]
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: tcpxo
+            operator: In
+            values:
+            - daemon
+        topologyKey: "kubernetes.io/hostname"
+  nodeSelector:
+    cloud.google.com/gke-accelerator: nvidia-h100-mega-80gb
+  containers:
+    # RxDM sidecar — receives GPU-direct data from remote nodes
+    - name: tcpxo-daemon
+      image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.21
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -ex
+          chmod 755 /fts/entrypoint_rxdm_container.sh
+          /fts/entrypoint_rxdm_container.sh --num_hops=2 --num_nics=8
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+            - NET_BIND_SERVICE
+      volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
+        - name: sys
+          mountPath: /hostsysfs
+        - name: proc-sys
+          mountPath: /hostprocsysfs
+      env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+
+    # vLLM head — Ray head + API server + PP stage 0
+    - name: vllm
+      image: vllm/vllm-openai:latest
+      imagePullPolicy: Always
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -ex
+
+          # Create plugins-only directory (no libnccl.so — keep vLLM's bundled NCCL)
+          mkdir -p /opt/nccl-plugins
+          for f in libnccl-net.so libnccl-net_internal.so libnccl-tuner.so \
+                   a3plus_guest_config.textproto a3plus_guest_config_simple.textproto \
+                   a3plus_tuner_config.textproto a3plus_tuner_config_simple.textproto; do
+            if [ -f "/usr/local/nvidia/lib64/$f" ]; then
+              ln -sf "/usr/local/nvidia/lib64/$f" "/opt/nccl-plugins/$f"
+              echo "Linked: $f"
+            fi
+          done
+          ls -la /opt/nccl-plugins/
+
+          # Prepend plugin path to LD_LIBRARY_PATH (keeps CUDA/driver paths)
+          export LD_LIBRARY_PATH="/opt/nccl-plugins:${LD_LIBRARY_PATH}"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
+          # Verify vLLM's own NCCL is used
+          echo "=== NCCL Version Check ==="
+          python3 -c "import torch; print(f'vLLM NCCL: {torch.cuda.nccl.version()}')" 2>/dev/null || true
+
+          # Install Ray + upgrade transformers for glm_moe_dsa architecture
+          pip install ray[default] 2>&1 | tail -3
+          pip install --upgrade transformers 2>&1 | tail -3
+
+          # Start Ray head
+          ray start --head --port=6379 --dashboard-host=0.0.0.0
+
+          echo "Waiting for 2 Ray nodes..."
+          for i in $(seq 1 120); do
+            NODES=$(python3 -c "import ray; ray.init(address='auto'); print(len(ray.nodes()))" 2>/dev/null || echo "0")
+            echo "Attempt $i: $NODES nodes connected"
+            if [ "$NODES" -ge 2 ] 2>/dev/null; then break; fi
+            sleep 10
+          done
+          echo "Ray cluster ready with $NODES nodes!"
+
+          # Launch vLLM with customer config:
+          # GLM-5.1 (753B MoE), TP=8 (intra-node), PP=2 (inter-node)
+          python3 -m vllm.entrypoints.openai.api_server \
+            --model zai-org/GLM-5.1 \
+            --tensor-parallel-size 8 \
+            --pipeline-parallel-size 2 \
+            --distributed-executor-backend ray \
+            --host 0.0.0.0 \
+            --port 8000 \
+            --max-model-len 202752 \
+            --max-num-seqs 2 \
+            --gpu-memory-utilization 0.8 \
+            --kv-cache-dtype fp8 \
+            --trust-remote-code \
+            --dtype auto \
+            --enforce-eager 2>&1
+      env:
+        # Guest config checker (required by TCPXO shim)
+        - name: NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE
+          value: /opt/nccl-plugins/a3plus_guest_config.textproto
+        # TCPXO FasTrak — all ENFORCED vars from guest_config_checker
+        - name: NCCL_FASTRAK_CTRL_DEV
+          value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
+        - name: NCCL_FASTRAK_IFNAME
+          value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
+        - name: NCCL_SOCKET_IFNAME
+          value: eth0
+        - name: NCCL_CROSS_NIC
+          value: "0"
+        - name: NCCL_PROTO
+          value: "Simple,LL128"
+        - name: NCCL_MIN_NCHANNELS
+          value: "4"
+        - name: NCCL_NVLSTREE_MAX_CHUNKSIZE
+          value: "131072"
+        - name: NCCL_P2P_NET_CHUNKSIZE
+          value: "524288"
+        - name: NCCL_P2P_PCI_CHUNKSIZE
+          value: "524288"
+        - name: NCCL_P2P_NVL_CHUNKSIZE
+          value: "1048576"
+        - name: NCCL_FASTRAK_NUM_FLOWS
+          value: "2"
+        - name: NCCL_FASTRAK_USE_SNAP
+          value: "1"
+        - name: NCCL_FASTRAK_ENABLE_CONTROL_CHANNEL
+          value: "0"
+        - name: NCCL_BUFFSIZE
+          value: "8388608"
+        - name: NCCL_NET_GDR_LEVEL
+          value: PIX
+        - name: NCCL_FASTRAK_ENABLE_HOTPATH_LOGGING
+          value: "0"
+        - name: NCCL_FASTRAK_USE_LLCM
+          value: "1"
+        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
+          value: /dev/aperture_devices
+        # Tuner
+        - name: NCCL_TUNER_PLUGIN
+          value: libnccl-tuner.so
+        - name: NCCL_TUNER_CONFIG_PATH
+          value: /opt/nccl-plugins/a3plus_tuner_config.textproto
+        - name: NCCL_FASTRAK_PLUGIN_ACCEPT_TIMEOUT_MS
+          value: "600000"
+        # Debug + Ray
+        - name: NCCL_DEBUG
+          value: INFO
+        - name: RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
+          value: "1"
+        - name: HF_TOKEN
+          value: ""
+      volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
+          readOnly: true
+        - name: shared-memory
+          mountPath: /dev/shm
+        - name: aperture-devices
+          mountPath: /dev/aperture_devices
+        - name: model-cache
+          mountPath: /root/.cache
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+      ports:
+        - containerPort: 8000
+        - containerPort: 6379
+        - containerPort: 8265
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  volumes:
+    - name: nvidia
+      hostPath:
+        path: /home/kubernetes/bin/nvidia/lib64
+    - name: shared-memory
+      emptyDir:
+        medium: "Memory"
+        sizeLimit: 200Gi
+    - name: sys
+      hostPath:
+        path: /sys
+    - name: proc-sys
+      hostPath:
+        path: /proc/sys
+    - name: aperture-devices
+      hostPath:
+        path: /dev/aperture_devices
+    - name: model-cache
+      emptyDir: {}
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: vllm-worker
+  labels:
+    name: vllm-worker
+    tcpxo: daemon
+  annotations:
+    devices.gke.io/container.tcpxo-daemon: |+
+      - path: /dev/nvidia0
+      - path: /dev/nvidia1
+      - path: /dev/nvidia2
+      - path: /dev/nvidia3
+      - path: /dev/nvidia4
+      - path: /dev/nvidia5
+      - path: /dev/nvidia6
+      - path: /dev/nvidia7
+      - path: /dev/nvidiactl
+      - path: /dev/nvidia-uvm
+      - path: /dev/dmabuf_import_helper
+    networking.gke.io/default-interface: 'eth0'
+    networking.gke.io/interfaces: |
+      [
+        {"interfaceName":"eth0","network":"default"},
+        {"interfaceName":"eth1","network":"vpc1"},
+        {"interfaceName":"eth2","network":"vpc2"},
+        {"interfaceName":"eth3","network":"vpc3"},
+        {"interfaceName":"eth4","network":"vpc4"},
+        {"interfaceName":"eth5","network":"vpc5"},
+        {"interfaceName":"eth6","network":"vpc6"},
+        {"interfaceName":"eth7","network":"vpc7"},
+        {"interfaceName":"eth8","network":"vpc8"}
+      ]
+spec:
+  affinity:
+    podAntiAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+      - labelSelector:
+          matchExpressions:
+          - key: tcpxo
+            operator: In
+            values:
+            - daemon
+        topologyKey: "kubernetes.io/hostname"
+  nodeSelector:
+    cloud.google.com/gke-accelerator: nvidia-h100-mega-80gb
+  containers:
+    - name: tcpxo-daemon
+      image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.21
+      imagePullPolicy: Always
+      command: ["/bin/sh", "-c"]
+      args:
+        - |
+          set -ex
+          chmod 755 /fts/entrypoint_rxdm_container.sh
+          /fts/entrypoint_rxdm_container.sh --num_hops=2 --num_nics=8
+      securityContext:
+        capabilities:
+          add:
+            - NET_ADMIN
+            - NET_BIND_SERVICE
+      volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
+        - name: sys
+          mountPath: /hostsysfs
+        - name: proc-sys
+          mountPath: /hostprocsysfs
+      env:
+        - name: LD_LIBRARY_PATH
+          value: /usr/local/nvidia/lib64
+    - name: vllm-worker
+      image: vllm/vllm-openai:latest
+      imagePullPolicy: Always
+      command: ["/bin/bash", "-c"]
+      args:
+        - |
+          set -ex
+
+          # Create plugins-only directory
+          mkdir -p /opt/nccl-plugins
+          for f in libnccl-net.so libnccl-net_internal.so libnccl-tuner.so \
+                   a3plus_guest_config.textproto a3plus_guest_config_simple.textproto \
+                   a3plus_tuner_config.textproto a3plus_tuner_config_simple.textproto; do
+            if [ -f "/usr/local/nvidia/lib64/$f" ]; then
+              ln -sf "/usr/local/nvidia/lib64/$f" "/opt/nccl-plugins/$f"
+            fi
+          done
+
+          # Prepend plugin path
+          export LD_LIBRARY_PATH="/opt/nccl-plugins:${LD_LIBRARY_PATH}"
+
+          pip install ray[default] 2>&1 | tail -3
+          pip install --upgrade transformers 2>&1 | tail -3
+          ray start --address=vllm-head-svc:6379 --block
+      env:
+        - name: NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE
+          value: /opt/nccl-plugins/a3plus_guest_config.textproto
+        - name: NCCL_FASTRAK_CTRL_DEV
+          value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
+        - name: NCCL_FASTRAK_IFNAME
+          value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
+        - name: NCCL_SOCKET_IFNAME
+          value: eth0
+        - name: NCCL_CROSS_NIC
+          value: "0"
+        - name: NCCL_PROTO
+          value: "Simple,LL128"
+        - name: NCCL_MIN_NCHANNELS
+          value: "4"
+        - name: NCCL_NVLSTREE_MAX_CHUNKSIZE
+          value: "131072"
+        - name: NCCL_P2P_NET_CHUNKSIZE
+          value: "524288"
+        - name: NCCL_P2P_PCI_CHUNKSIZE
+          value: "524288"
+        - name: NCCL_P2P_NVL_CHUNKSIZE
+          value: "1048576"
+        - name: NCCL_FASTRAK_NUM_FLOWS
+          value: "2"
+        - name: NCCL_FASTRAK_USE_SNAP
+          value: "1"
+        - name: NCCL_FASTRAK_ENABLE_CONTROL_CHANNEL
+          value: "0"
+        - name: NCCL_BUFFSIZE
+          value: "8388608"
+        - name: NCCL_NET_GDR_LEVEL
+          value: PIX
+        - name: NCCL_FASTRAK_ENABLE_HOTPATH_LOGGING
+          value: "0"
+        - name: NCCL_FASTRAK_USE_LLCM
+          value: "1"
+        - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
+          value: /dev/aperture_devices
+        - name: NCCL_TUNER_PLUGIN
+          value: libnccl-tuner.so
+        - name: NCCL_TUNER_CONFIG_PATH
+          value: /opt/nccl-plugins/a3plus_tuner_config.textproto
+        - name: NCCL_FASTRAK_PLUGIN_ACCEPT_TIMEOUT_MS
+          value: "600000"
+        - name: NCCL_DEBUG
+          value: INFO
+        - name: RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
+          value: "1"
+        - name: HF_TOKEN
+          value: ""
+      volumeMounts:
+        - name: nvidia
+          mountPath: /usr/local/nvidia/lib64
+          readOnly: true
+        - name: shared-memory
+          mountPath: /dev/shm
+        - name: aperture-devices
+          mountPath: /dev/aperture_devices
+        - name: model-cache
+          mountPath: /root/.cache
+      resources:
+        limits:
+          nvidia.com/gpu: 8
+  tolerations:
+    - key: nvidia.com/gpu
+      operator: Exists
+      effect: NoSchedule
+  volumes:
+    - name: nvidia
+      hostPath:
+        path: /home/kubernetes/bin/nvidia/lib64
+    - name: shared-memory
+      emptyDir:
+        medium: "Memory"
+        sizeLimit: 200Gi
+    - name: sys
+      hostPath:
+        path: /sys
+    - name: proc-sys
+      hostPath:
+        path: /proc/sys
+    - name: aperture-devices
+      hostPath:
+        path: /dev/aperture_devices
+    - name: model-cache
+      emptyDir: {}
