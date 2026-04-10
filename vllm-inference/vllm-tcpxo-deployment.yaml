@@ -1,14 +1,16 @@
 # vLLM Distributed Inference with GPUDirect-TCPXO on A3 Mega
 # 2 nodes × 8 H100 GPUs = TP=16 with full TCPXO inter-node bandwidth (~188 GB/s)
 #
-# Key: Uses host NCCL 2.28.7 (via LD_PRELOAD) to match TCPXO shim version.
-# vLLM bundles NCCL 2.27.5 which is incompatible with the shim.
-# All NCCL_FASTRAK_* env vars from official nccl-test-latest.yaml are included.
+# Approach: Mount ONLY the NCCL net plugin + tuner into the vLLM container.
+# vLLM uses its own bundled NCCL (2.27.5 via PyTorch). The TCPXO shim
+# (libnccl-net.so, v7 API) is compatible with NCCL 2.27.5+.
+# We create a symlink directory (/opt/nccl-plugins/) with only the plugin
+# files, NOT libnccl.so, to avoid replacing vLLM's bundled NCCL.
 
 apiVersion: v1
 kind: Service
 metadata:
-  name: vllm-head
+  name: vllm-head-svc
 spec:
   selector:
     name: vllm-head
@@ -26,7 +28,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: vllm-worker
+  name: vllm-worker-svc
 spec:
   selector:
     name: vllm-worker
@@ -79,6 +81,7 @@ spec:
   nodeSelector:
     cloud.google.com/gke-accelerator: nvidia-h100-mega-80gb
   containers:
+    # RxDM sidecar — receives GPU-direct data from remote nodes
     - name: tcpxo-daemon
       image: us-docker.pkg.dev/gce-ai-infra/gpudirect-tcpxo/tcpgpudmarxd-dev:v1.0.21
       imagePullPolicy: Always
@@ -103,6 +106,8 @@ spec:
       env:
         - name: LD_LIBRARY_PATH
           value: /usr/local/nvidia/lib64
+
+    # vLLM head node — runs Ray head + vLLM API server
     - name: vllm
       image: vllm/vllm-openai:latest
       imagePullPolicy: Always
@@ -110,6 +115,26 @@ spec:
       args:
         - |
           set -ex
+
+          # Create a plugins-only directory (NO libnccl.so to avoid replacing vLLM's bundled NCCL)
+          mkdir -p /opt/nccl-plugins
+          for f in libnccl-net.so libnccl-net_internal.so libnccl-tuner.so \
+                   a3plus_guest_config.textproto a3plus_guest_config_simple.textproto \
+                   a3plus_tuner_config.textproto a3plus_tuner_config_simple.textproto; do
+            if [ -f "/usr/local/nvidia/lib64/$f" ]; then
+              ln -sf "/usr/local/nvidia/lib64/$f" "/opt/nccl-plugins/$f"
+              echo "Linked: $f"
+            fi
+          done
+          ls -la /opt/nccl-plugins/
+
+          # APPEND plugin path to LD_LIBRARY_PATH (don't replace — keeps CUDA/nvidia driver paths)
+          export LD_LIBRARY_PATH="/opt/nccl-plugins:${LD_LIBRARY_PATH}"
+          echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+
+          # Verify we are NOT overriding vLLM's NCCL
+          echo "vLLM bundled NCCL:"
+          python3 -c "import torch; print(f'  torch NCCL: {torch.cuda.nccl.version()}')" 2>/dev/null || true
 
           # Install Ray for multi-node coordination
           pip install ray[default] 2>&1 | tail -3
@@ -126,7 +151,7 @@ spec:
           done
           echo "Ray cluster ready with $NODES nodes!"
 
-          # Launch vLLM with TP=16 across 2 nodes (TCPXO for inter-node)
+          # Launch vLLM with TP=16 across 2 nodes
           python3 -m vllm.entrypoints.openai.api_server \
             --model NousResearch/Meta-Llama-3-8B \
             --tensor-parallel-size 16 \
@@ -138,14 +163,10 @@ spec:
             --dtype float16 \
             --enforce-eager 2>&1
       env:
-        # Force host NCCL 2.28.7 (matches TCPXO shim) instead of vLLM's bundled 2.27.5
-        - name: LD_PRELOAD
-          value: /usr/local/nvidia/lib64/libnccl.so.2
-        - name: LD_LIBRARY_PATH
-          value: /usr/local/nvidia/lib64
-        # Guest config checker config file (required by TCPXO shim)
+        # NOTE: LD_LIBRARY_PATH is set in the script (prepend /opt/nccl-plugins to defaults)
+        # Guest config checker (required by TCPXO shim to validate env)
         - name: NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE
-          value: /usr/local/nvidia/lib64/a3plus_guest_config.textproto
+          value: /opt/nccl-plugins/a3plus_guest_config.textproto
         # TCPXO FasTrak configuration — all ENFORCED vars from guest_config_checker
         - name: NCCL_FASTRAK_CTRL_DEV
           value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
@@ -183,14 +204,14 @@ spec:
           value: "1"
         - name: NCCL_FASTRAK_LLCM_DEVICE_DIRECTORY
           value: /dev/aperture_devices
-        # Recommended by guest_config_checker
+        # Tuner configuration
         - name: NCCL_TUNER_PLUGIN
           value: libnccl-tuner.so
         - name: NCCL_TUNER_CONFIG_PATH
-          value: /usr/local/nvidia/lib64/a3plus_tuner_config.textproto
+          value: /opt/nccl-plugins/a3plus_tuner_config.textproto
         - name: NCCL_FASTRAK_PLUGIN_ACCEPT_TIMEOUT_MS
           value: "600000"
-        # vLLM / Ray settings
+        # Debug + Ray settings
         - name: NCCL_DEBUG
           value: INFO
         - name: RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES
@@ -200,6 +221,7 @@ spec:
       volumeMounts:
         - name: nvidia
           mountPath: /usr/local/nvidia/lib64
+          readOnly: true
         - name: shared-memory
           mountPath: /dev/shm
         - name: aperture-devices
@@ -315,16 +337,26 @@ spec:
       args:
         - |
           set -ex
+
+          # Create plugins-only directory
+          mkdir -p /opt/nccl-plugins
+          for f in libnccl-net.so libnccl-net_internal.so libnccl-tuner.so \
+                   a3plus_guest_config.textproto a3plus_guest_config_simple.textproto \
+                   a3plus_tuner_config.textproto a3plus_tuner_config_simple.textproto; do
+            if [ -f "/usr/local/nvidia/lib64/$f" ]; then
+              ln -sf "/usr/local/nvidia/lib64/$f" "/opt/nccl-plugins/$f"
+            fi
+          done
+
+          # APPEND plugin path to LD_LIBRARY_PATH
+          export LD_LIBRARY_PATH="/opt/nccl-plugins:${LD_LIBRARY_PATH}"
+
           pip install ray[default] 2>&1 | tail -3
           # Connect to Ray head node and block
-          ray start --address=vllm-head:6379 --block
+          ray start --address=vllm-head-svc:6379 --block
       env:
-        - name: LD_PRELOAD
-          value: /usr/local/nvidia/lib64/libnccl.so.2
-        - name: LD_LIBRARY_PATH
-          value: /usr/local/nvidia/lib64
         - name: NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE
-          value: /usr/local/nvidia/lib64/a3plus_guest_config.textproto
+          value: /opt/nccl-plugins/a3plus_guest_config.textproto
         - name: NCCL_FASTRAK_CTRL_DEV
           value: eth1,eth2,eth3,eth4,eth5,eth6,eth7,eth8
         - name: NCCL_FASTRAK_IFNAME
@@ -364,7 +396,7 @@ spec:
         - name: NCCL_TUNER_PLUGIN
           value: libnccl-tuner.so
         - name: NCCL_TUNER_CONFIG_PATH
-          value: /usr/local/nvidia/lib64/a3plus_tuner_config.textproto
+          value: /opt/nccl-plugins/a3plus_tuner_config.textproto
         - name: NCCL_FASTRAK_PLUGIN_ACCEPT_TIMEOUT_MS
           value: "600000"
         - name: NCCL_DEBUG
@@ -374,6 +406,7 @@ spec:
       volumeMounts:
         - name: nvidia
           mountPath: /usr/local/nvidia/lib64
+          readOnly: true
         - name: shared-memory
           mountPath: /dev/shm
         - name: aperture-devices

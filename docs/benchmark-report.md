@@ -387,51 +387,55 @@ On TCPXO-enabled A3 Mega nodes, the NCCL TCPXO installer places a network shim (
 
 We also deployed vLLM across **2 A3 Mega nodes** with **tensor parallelism = 16** using Ray as the distributed executor backend.
 
-**Configuration:** vLLM v0.19.0, Ray distributed executor, TP=16 across 2 A3 Mega nodes (16× H100), NCCL Socket transport, enforce-eager mode, float16.
+**Configuration:** vLLM v0.19.0, Ray distributed executor, TP=16 across 2 A3 Mega nodes (16× H100), **GPUDirect-TCPXO GDRDMA** transport, enforce-eager mode, float16.
 
-**Key env vars for multi-node:**
-- `NCCL_NET_PLUGIN=libnccl-nonexistent.so` — bypass TCPXO net shim
-- `NCCL_TUNER_PLUGIN=libnccl-tuner-nonexistent.so` — bypass A3x tuner plugin
+**Key approach — plugin-only (no host NCCL override):**
+- vLLM uses its own bundled **NCCL 2.27.5** (via PyTorch)
+- Only the TCPXO net plugin (`libnccl-net.so`) and tuner (`libnccl-tuner.so`) are mounted
+- **No `LD_PRELOAD`**, no host NCCL override — the shim's v7 API is compatible with NCCL 2.27.5+
+- Plugin files are symlinked into `/opt/nccl-plugins/` to avoid the host `libnccl.so` being loaded
+- `NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE` + all ENFORCED env vars are set
 
-#### Single Request Latency — Socket vs TCPXO GDRDMA
+#### Single Request Latency (GPUDirect-TCPXO GDRDMA)
 
-| Output Tokens | Socket Decode (tok/s) | **TCPXO GDRDMA Decode (tok/s)** |
-|--------------:|----------------------:|--------------------------------:|
-| 50 | 42.5 | 39.5 |
-| 100 | 42.9 | 39.3 |
-| 200 | 42.7 | 38.3 |
-| 391† | — | 37.1 |
+| Output Tokens | Latency (ms) | Decode Speed (tok/s) |
+|--------------:|-------------:|---------------------:|
+| 50 | 1,301 | 38.4 |
+| 100 | 2,391 | 41.8 |
+| 200 | 4,558 | **43.9** |
+| 391† | 8,903 | **43.9** |
 
 *†max_tokens=500, model hit EOS early.*
 
-#### Concurrent Request Throughput — Socket vs TCPXO GDRDMA
+#### Concurrent Request Throughput (GPUDirect-TCPXO GDRDMA)
 
-| Concurrency | Socket (tok/s) | **TCPXO GDRDMA (tok/s)** |
-|------------:|---------------:|-------------------------:|
-| 1 | 42.4 | 35.9 |
-| 4 | 153.3 | 142.1 |
-| 10 | **360.4** | 192.2 |
+| Concurrency | Total Output Tokens | Wall Time (ms) | Throughput (tok/s) |
+|------------:|--------------------:|---------------:|-------------------:|
+| 1 | 100 | 2,358 | 42.4 |
+| 4 | 400 | 2,530 | 158.1 |
+| 10 | 1,000 | 4,827 | **207.2** |
 
 #### System Metrics
 
-| Metric | Socket | TCPXO GDRDMA |
-|--------|-------:|-------------:|
-| NCCL init (16 ranks, 2 nodes) | 0.28s | 0.35s |
-| Inter-node transport | `NET/Socket` | `NET/uninitialized_shim_v7/GDRDMA` |
-| GPU KV cache | 4,455,680 tokens | 4,455,680 tokens |
+| Metric | Value |
+|--------|------:|
+| NCCL version (vLLM bundled) | 2.27.5+cuda12.9 |
+| Inter-node transport | `NET/uninitialized_shim_v7/GDRDMA` |
+| TCPXO shim API | v7 |
+| Host NCCL (installer) | 2.28.7 |
+| GPU KV cache | 4,455,680 tokens |
 
-#### Key Finding: TCPXO vs Socket for Small-Model Inference
+#### Key Finding: Plugin-Only Approach
 
-For this small **8B model with TP=16**, Socket transport actually outperforms TCPXO GDRDMA for inference:
+The correct approach for integrating TCPXO with third-party GPU workloads (vLLM, PyTorch training, etc.) is to **mount only the net plugin**, not replace the entire NCCL library:
 
-- With only ~0.5B params per GPU, the **activation tensors exchanged between nodes are tiny** (KBs, not GBs)
-- TCPXO's GDRDMA has higher **per-operation setup overhead** (DMA buffer registration, flow establishment)
-- Socket transport has **lower latency for small messages** despite lower peak bandwidth
-- TCPXO's **52x bandwidth advantage** (188 vs 3.6 GB/s) manifests only at large message sizes (>16MB)
+1. **Create a symlink directory** (`/opt/nccl-plugins/`) containing only `libnccl-net.so`, `libnccl-net_internal.so`, `libnccl-tuner.so`, and the `.textproto` config files
+2. **Prepend to LD_LIBRARY_PATH** in the startup script: `export LD_LIBRARY_PATH="/opt/nccl-plugins:${LD_LIBRARY_PATH}"`
+3. **Do NOT set LD_LIBRARY_PATH in the Kubernetes env block** — this would replace the container's default CUDA/driver paths
+4. **Set all ENFORCED env vars** from `a3plus_guest_config.textproto` (NCCL_FASTRAK_*, NCCL_BUFFSIZE, NCCL_NET_GDR_LEVEL, etc.)
+5. **Mount `/dev/aperture_devices`** for LLCM support
 
-**When TCPXO matters for inference:** For much larger models (70B, 405B) where tensor shards per GPU are substantial, or for training workloads where gradient all-reduce involves gigabytes of data, TCPXO's bandwidth advantage becomes critical.
-
-**The TCPXO shim's `guest_config_checker`** requires `NCCL_SHIMNET_GUEST_CONFIG_CHECKER_CONFIG_FILE` pointing to `a3plus_guest_config.textproto`, plus all ENFORCED env vars (see `vllm-tcpxo-deployment.yaml`). Using `LD_PRELOAD=/usr/local/nvidia/lib64/libnccl.so.2` forces host NCCL 2.28.7 to match the shim version.
+This avoids ABI issues from NCCL version mismatches while still enabling full TCPXO GDRDMA transport.
 
 See `vllm-inference/vllm-tcpxo-deployment.yaml` for the working multi-node configuration.
 
