@@ -1,4 +1,4 @@
-# GPUDirect-TCPXO Benchmarks on GKE A3 Mega (H100)
+# GPUDirect-TCPXO Benchmarks on GKE A3 Mega (H100)-GLM 5.1
 
 End-to-end guide and benchmark results for **GPUDirect-TCPXO (FasTrak)** on Google Kubernetes Engine using **A3 Mega** VMs with **NVIDIA H100 Mega 80GB** GPUs.
 
